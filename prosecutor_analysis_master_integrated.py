@@ -50,6 +50,115 @@ import os
 from collections import Counter
 warnings.filterwarnings('ignore')
 
+# ================================================================================
+# NORMALIZATION UTILITIES FOR MATCHING
+# ================================================================================
+
+STATE_ABBREV_TO_NAME = {
+    'AL': 'Alabama', 'AK': 'Alaska', 'AZ': 'Arizona', 'AR': 'Arkansas',
+    'CA': 'California', 'CO': 'Colorado', 'CT': 'Connecticut', 'DE': 'Delaware',
+    'FL': 'Florida', 'GA': 'Georgia', 'HI': 'Hawaii', 'ID': 'Idaho',
+    'IL': 'Illinois', 'IN': 'Indiana', 'IA': 'Iowa', 'KS': 'Kansas',
+    'KY': 'Kentucky', 'LA': 'Louisiana', 'ME': 'Maine', 'MD': 'Maryland',
+    'MA': 'Massachusetts', 'MI': 'Michigan', 'MN': 'Minnesota', 'MS': 'Mississippi',
+    'MO': 'Missouri', 'MT': 'Montana', 'NE': 'Nebraska', 'NV': 'Nevada',
+    'NH': 'New Hampshire', 'NJ': 'New Jersey', 'NM': 'New Mexico', 'NY': 'New York',
+    'NC': 'North Carolina', 'ND': 'North Dakota', 'OH': 'Ohio', 'OK': 'Oklahoma',
+    'OR': 'Oregon', 'PA': 'Pennsylvania', 'RI': 'Rhode Island', 'SC': 'South Carolina',
+    'SD': 'South Dakota', 'TN': 'Tennessee', 'TX': 'Texas', 'UT': 'Utah',
+    'VT': 'Vermont', 'VA': 'Virginia', 'WA': 'Washington', 'WV': 'West Virginia',
+    'WI': 'Wisconsin', 'WY': 'Wyoming', 'DC': 'District of Columbia'
+}
+
+STATE_NAME_TO_ABBREV = {v: k for k, v in STATE_ABBREV_TO_NAME.items()}
+
+NICKNAME_MAP = {
+    'bob': 'robert', 'robert': 'bob',
+    'bill': 'william', 'william': 'bill',
+    'jim': 'james', 'james': 'jim',
+    'joe': 'joseph', 'joseph': 'joe',
+    'kim': 'kimberly', 'kimberly': 'kim',
+    'mike': 'michael', 'michael': 'mike',
+    'dan': 'daniel', 'daniel': 'dan',
+    'dave': 'david', 'david': 'dave',
+    'steve': 'steven', 'steven': 'steve',
+    'tony': 'anthony', 'anthony': 'tony',
+    'liz': 'elizabeth', 'beth': 'elizabeth', 'elizabeth': 'liz',
+    'alex': 'alexander', 'alexander': 'alex',
+    'sue': 'susan', 'susan': 'sue',
+    'greg': 'gregory', 'gregory': 'greg'
+}
+
+
+def std_series(s):
+    """Lowercase + collapse whitespace for consistent string comparisons."""
+    return s.astype(str).str.lower().str.strip().str.replace(r"\s+", " ", regex=True)
+
+
+def std_value(value):
+    """Standardize a single value using std_series semantics."""
+    return std_series(pd.Series([value])).iat[0] if isinstance(value, str) else ''
+
+
+def normalize_state_name(value):
+    """Return the full state name given either full name or abbreviation."""
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not v:
+        return None
+    upper = v.upper()
+    if upper in STATE_ABBREV_TO_NAME:
+        return STATE_ABBREV_TO_NAME[upper]
+    title = v.title()
+    if title in STATE_NAME_TO_ABBREV:
+        return title
+    return title
+
+
+def norm_first(value: str) -> str:
+    """Normalize a first name for matching (nicknames + initials)."""
+    if not isinstance(value, str) or not value.strip():
+        return ''
+    value = value.strip().lower()
+    return NICKNAME_MAP.get(value, value)
+
+
+def first_name_compatible(a: str, b: str) -> bool:
+    """Check whether two first names are compatible (nickname/initial aware)."""
+    a_norm = norm_first(a)
+    b_norm = norm_first(b)
+    if not a_norm or not b_norm:
+        return True
+    if a_norm == b_norm:
+        return True
+    if a_norm.startswith(b_norm) or b_norm.startswith(a_norm):
+        return True
+    return a_norm[0] == b_norm[0]
+
+
+def clean_jurisdiction_for_matching(text: str) -> str:
+    """Standardize jurisdiction strings (remove county, parentheticals, trim)."""
+    if not isinstance(text, str):
+        return ''
+    cleaned = re.sub(r'\s*\([^)]*\)', '', text)
+    cleaned = re.sub(r'County', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'Parish', '', cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace('Borough', '').replace('City', '')
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    return cleaned.strip().lower()
+
+
+def split_full_name(name: str):
+    """Split a full name into (first, last) components."""
+    if not isinstance(name, str) or not name.strip():
+        return '', ''
+    normalized = re.sub(r"[’]", "'", name.strip())
+    parts = normalized.split()
+    if len(parts) == 1:
+        return parts[0], ''
+    return ' '.join(parts[:-1]), parts[-1]
+
 # Set up plotting parameters
 plt.rcParams['font.family'] = 'DejaVu Sans'
 plt.rcParams['font.size'] = 11
@@ -241,9 +350,207 @@ class DataLoader:
                             self.state_respondent_counts[state_name] = 0
         
         print(f"✓ Identified {len(self.state_da_cols)} state prosecutor columns")
-        
+
         return self
 
+    # ------------------------------------------------------------------
+    # Metadata extraction helpers (names + jurisdictions)
+    # ------------------------------------------------------------------
+    def _get_question_label(self, col: str) -> str:
+        if self.questions_df is not None and col in self.questions_df.columns:
+            return str(self.questions_df[col].iloc[0])
+        return ''
+
+    def extract_notable_metadata(self, col: str) -> dict:
+        label = self._get_question_label(col)
+        tail = label.split(' - ')[-1].strip() if ' - ' in label else label.strip()
+        if not tail and col in Config.DA_NAMES:
+            name, jurisdiction = Config.DA_NAMES[col]
+        else:
+            if ',' in tail:
+                name, jurisdiction = tail.split(',', 1)
+                name = name.strip()
+                jurisdiction = jurisdiction.strip()
+            else:
+                name = tail.strip()
+                jurisdiction = ''
+        first, last = split_full_name(name)
+        state_abbrev = None
+        state_full = None
+        if jurisdiction:
+            parts = [p.strip() for p in jurisdiction.split(',') if p.strip()]
+            if parts:
+                poss_state = parts[-1]
+                state_full = normalize_state_name(poss_state)
+                if state_full and state_full in STATE_NAME_TO_ABBREV:
+                    state_abbrev = STATE_NAME_TO_ABBREV[state_full]
+        meta = {
+            'column': col,
+            'scope': 'national',
+            'is_notable': True,
+            'name': name,
+            'fname': first,
+            'lname': last,
+            'jurisdiction': jurisdiction,
+            'jurisdiction_clean': clean_jurisdiction_for_matching(jurisdiction),
+            'state_name': state_full,
+            'state_abbrev': state_abbrev,
+            'state_source': None
+        }
+        return meta
+
+    def extract_state_metadata(self, col: str) -> dict:
+        state_token = col.split('_')[0]
+        state_full = normalize_state_name(state_token) or state_token
+        state_abbrev = STATE_NAME_TO_ABBREV.get(state_full)
+        label = self._get_question_label(col)
+        tail = label.split(' - ')[-1].strip() if ' - ' in label else label.strip()
+        parts = [p.strip() for p in tail.split('\t') if p.strip()]
+        lname = parts[0] if len(parts) >= 1 else ''
+        fname = parts[1] if len(parts) >= 2 else ''
+        jurisdiction_core = parts[2] if len(parts) >= 3 else ''
+        if fname and lname:
+            name = f"{fname} {lname}".strip()
+        else:
+            name = tail if tail else col
+        first, last = split_full_name(name)
+        jurisdiction_display = ''
+        if jurisdiction_core:
+            suffix_state = state_abbrev or state_full
+            jurisdiction_display = f"{jurisdiction_core} County, {suffix_state}" if suffix_state else jurisdiction_core
+        meta = {
+            'column': col,
+            'scope': 'state',
+            'is_notable': False,
+            'name': name,
+            'fname': first if first else fname,
+            'lname': last if last else lname,
+            'jurisdiction': jurisdiction_display,
+            'jurisdiction_clean': clean_jurisdiction_for_matching(jurisdiction_core or jurisdiction_display or state_full),
+            'state_name': state_full,
+            'state_abbrev': state_abbrev,
+            'state_source': state_token
+        }
+        return meta
+
+
+# ================================================================================
+# ELECTION MATCHER
+# ================================================================================
+
+class ElectionMatcher:
+    """Robustly match survey prosecutors to election records."""
+
+    def __init__(self, elections_df: pd.DataFrame):
+        self.df = elections_df.copy()
+        self.df['cand_fname'] = self.df['cand_fname'].fillna('').astype(str)
+        self.df['cand_lname'] = self.df['cand_lname'].fillna('').astype(str)
+        self.df['state'] = self.df['state'].fillna('').astype(str)
+        self.df['std_fname'] = std_series(self.df['cand_fname'])
+        self.df['std_lname'] = std_series(self.df['cand_lname'])
+        self.df['std_state'] = std_series(self.df['state'])
+        self.df['election_year'] = pd.to_numeric(self.df['election_year'], errors='coerce')
+        self.df['jurisdiction_tokens'] = self.df.apply(self._compute_jurisdiction_tokens, axis=1)
+
+    def _compute_jurisdiction_tokens(self, row) -> frozenset:
+        tokens = set()
+        for col in ('district', 'counties_total'):
+            val = row.get(col)
+            if isinstance(val, str) and val.strip():
+                parts = [p.strip() for p in val.split(',') if p.strip()]
+                for part in parts:
+                    cleaned = clean_jurisdiction_for_matching(part)
+                    if cleaned:
+                        tokens.add(cleaned)
+        if not tokens:
+            tokens.add('')
+        return frozenset(tokens)
+
+    def find_matches(self, prosecutor_row: pd.Series):
+        """Return election rows (all cycles) for the best-matching candidate."""
+
+        lname = std_value(prosecutor_row.get('lname'))
+        if not lname:
+            return pd.DataFrame(), 'no_match', False
+
+        fname = std_value(prosecutor_row.get('fname'))
+        juris = clean_jurisdiction_for_matching(prosecutor_row.get('jurisdiction_clean') or prosecutor_row.get('jurisdiction'))
+
+        state_options = []
+        for state_candidate in [prosecutor_row.get('state_name'), prosecutor_row.get('state_source'), prosecutor_row.get('state_abbrev')]:
+            if state_candidate is None or pd.isna(state_candidate):
+                continue
+            full_name = normalize_state_name(state_candidate) if state_candidate and len(str(state_candidate)) <= 3 else state_candidate
+            normalized = normalize_state_name(full_name)
+            std_state = std_value(normalized)
+            if std_state and std_state not in state_options:
+                state_options.append(std_state)
+        state_options.append(None)  # allow fallback without state filter
+
+        best_matches = pd.DataFrame()
+        best_method = 'no_match'
+        fname_matched = False
+        selected_state = None
+
+        for state_norm in state_options:
+            candidates = self.df
+            method_prefix = 'any_state'
+            if state_norm:
+                candidates = candidates[candidates['std_state'] == state_norm]
+                method_prefix = 'state'
+            candidates = candidates[candidates['std_lname'] == lname]
+            if candidates.empty:
+                continue
+
+            method_candidate = f"{method_prefix}_lname"
+            filtered = candidates
+            if juris:
+                juris_mask = candidates['jurisdiction_tokens'].apply(lambda tokens: juris in tokens)
+                if juris_mask.any():
+                    filtered = candidates[juris_mask]
+                    method_candidate = f"{method_candidate}_juris"
+
+            if filtered.empty:
+                filtered = candidates
+
+            if fname:
+                compat_mask = filtered['std_fname'].apply(lambda x: first_name_compatible(fname, x))
+                if compat_mask.any():
+                    filtered = filtered[compat_mask]
+                    method_candidate = f"{method_candidate}_fname"
+                    fname_matched = True
+                else:
+                    fname_matched = False
+            else:
+                fname_matched = True
+
+            if not filtered.empty:
+                best_matches = filtered.copy()
+                best_method = method_candidate
+                selected_state = state_norm
+                break
+
+        if best_matches.empty:
+            return pd.DataFrame(), 'no_match', False
+
+        # Choose candidate with the most recent election
+        if 'candidate_unique_identifier' in best_matches.columns and best_matches['candidate_unique_identifier'].notna().any():
+            grouped = best_matches.groupby('candidate_unique_identifier')['election_year'].max()
+            best_id = grouped.idxmax()
+            matches = self.df[self.df['candidate_unique_identifier'] == best_id].copy()
+        else:
+            latest_year = best_matches['election_year'].max()
+            mask = (self.df['std_lname'] == lname) & (self.df['election_year'] == latest_year)
+            if selected_state:
+                mask &= self.df['std_state'] == selected_state
+            matches = self.df[mask].copy()
+            if matches.empty:
+                matches = best_matches.copy()
+
+        matches = matches.sort_values('election_year', ascending=False)
+        matches['match_method'] = best_method
+        matches['first_name_compatible'] = 'Y' if fname_matched else 'N'
+        return matches, best_method, fname_matched
 
 # ================================================================================
 # PROSECUTOR ANALYZER CLASS
@@ -266,67 +573,59 @@ class ProsecutorAnalyzer:
         # Results storage
         self.results = {}
         
-    def analyze_prosecutor_column(self, col, col_name=None, state_name=None):
-        """
-        Analyze a single prosecutor column with CORRECTED familiarity calculation
-        
-        Parameters:
-        -----------
-        col : str
-            Column name in the survey
-        col_name : str
-            Human-readable prosecutor name
-        state_name : str
-            State name (for state prosecutors only) - used to get correct denominator
-        """
-        if col_name is None:
-            col_name = col
-        
+    def analyze_prosecutor_column(self, col, metadata: dict):
+        """Analyze a single prosecutor column with CORRECTED familiarity calculation."""
+
+        col_name = metadata.get('name', col)
+        scope = metadata.get('scope', 'national')
+        state_source = metadata.get('state_source')
         responses = self.df_survey[col].dropna()
-        
-        # CRITICAL CORRECTION: Determine correct denominator
-        if state_name and state_name in self.state_respondent_counts:
-            # State prosecutor: use only respondents from that state who engaged with state section
-            # "Engaged" means they responded to at least one state prosecutor from their state
-            state_mask = self.df_survey['RespondentState'] == state_name
+
+        # Determine denominator based on scope
+        if scope == 'state' and state_source and 'RespondentState' in self.df_survey.columns:
+            state_mask = self.df_survey['RespondentState'] == state_source
             state_respondents = self.df_survey[state_mask]
-            
-            # Find all state prosecutor columns for this state
-            state_cols_for_this_state = [c for c in self.state_da_cols if c.startswith(state_name + '_')]
-            
-            # Count how many state respondents engaged with state prosecutors
+            state_cols_for_this_state = [c for c in self.state_da_cols if c.startswith(state_source + '_')]
+
             engaged_count = 0
             for idx in state_respondents.index:
                 if any(pd.notna(self.df_survey.loc[idx, c]) for c in state_cols_for_this_state):
                     engaged_count += 1
-            
-            total_responses = engaged_count if engaged_count > 0 else self.state_respondent_counts[state_name]
+
+            total_responses = engaged_count if engaged_count > 0 else self.state_respondent_counts.get(state_source, 0)
         else:
-            # Notable prosecutor: use completed_national_section (those who reached end of national section)
             total_responses = self.completed_national_section
-        
-        # Convert to numeric
+
         numeric_ratings = responses.map(Config.RATING_MAP)
         substantive_ratings = numeric_ratings.dropna()
-        
+
         if len(substantive_ratings) == 0:
             return None
-        
-        # CORRECTED familiarity rate calculation
+
         familiarity_rate = (len(substantive_ratings) / total_responses) * 100 if total_responses > 0 else 0
-        
+
         result = {
             'column': col,
             'name': col_name,
-            'state': state_name if state_name else 'National',
+            'scope': scope,
+            'state_display': metadata.get('state_name') or metadata.get('state_source') or 'National',
+            'state': metadata.get('state_name') or metadata.get('state_source') or 'National',
+            'state_name': metadata.get('state_name'),
+            'state_abbrev': metadata.get('state_abbrev'),
+            'state_source': state_source,
             'total_responses': total_responses,
             'substantive_ratings': len(substantive_ratings),
             'familiarity_rate': familiarity_rate,
             'mean_score': substantive_ratings.mean(),
             'median_score': substantive_ratings.median(),
             'std_score': substantive_ratings.std(),
+            'fname': metadata.get('fname'),
+            'lname': metadata.get('lname'),
+            'jurisdiction': metadata.get('jurisdiction'),
+            'jurisdiction_clean': metadata.get('jurisdiction_clean'),
+            'is_notable': metadata.get('is_notable', False)
         }
-        
+
         return result
     
     def build_prosecutor_dataset(self):
@@ -338,42 +637,33 @@ class ProsecutorAnalyzer:
         # Process notable prosecutors (all respondents as denominator)
         print("Processing notable prosecutors...")
         for col in self.notable_cols:
-            if col in Config.DA_NAMES:
-                name, location = Config.DA_NAMES[col]
-                result = self.analyze_prosecutor_column(col, name, state_name=None)
-                if result:
-                    result['location'] = location
-                    result['is_notable'] = True
-                    result['name'] = name
-                    all_prosecutors.append(result)
-        
-        print(f"✓ Processed {len([p for p in all_prosecutors if p['is_notable']])} notable prosecutors")
+            meta = self.loader.extract_notable_metadata(col)
+            if not meta.get('name'):
+                continue
+            result = self.analyze_prosecutor_column(col, meta)
+            if result:
+                result['location'] = meta.get('jurisdiction') or meta.get('state_name') or 'National'
+                all_prosecutors.append(result)
+
+        print(f"✓ Processed {len([p for p in all_prosecutors if p.get('is_notable')])} notable prosecutors")
         
         # Process state prosecutors (state-specific denominators)
         print("\nProcessing state prosecutors with CORRECTED denominators...")
         state_counts = {}
         
         for col in self.state_da_cols:
-            # Extract state from column name (e.g., "California_1" -> "California")
-            state_name = col.split('_')[0]
-            
-            # Get prosecutor name from question text
-            if self.questions_df is not None and col in self.questions_df.columns:
-                question_text = self.questions_df[col].iloc[0]
-                if ' - ' in question_text:
-                    name = question_text.split(' - ')[-1].strip()
-                    
-                    # CRITICAL: Pass state_name to get correct denominator
-                    result = self.analyze_prosecutor_column(col, name, state_name=state_name)
-                    if result:
-                        result['location'] = state_name
-                        result['is_notable'] = False
-                        result['name'] = name
-                        all_prosecutors.append(result)
-                        
-                        state_counts[state_name] = state_counts.get(state_name, 0) + 1
-        
-        print(f"✓ Processed {len([p for p in all_prosecutors if not p['is_notable']])} state prosecutors")
+            meta = self.loader.extract_state_metadata(col)
+            if not meta.get('name'):
+                continue
+            result = self.analyze_prosecutor_column(col, meta)
+            if result:
+                result['location'] = meta.get('jurisdiction') or meta.get('state_name') or meta.get('state_source')
+                all_prosecutors.append(result)
+
+                state_key = meta.get('state_source') or meta.get('state_name') or 'Unknown'
+                state_counts[state_key] = state_counts.get(state_key, 0) + 1
+
+        print(f"✓ Processed {len([p for p in all_prosecutors if not p.get('is_notable')])} state prosecutors")
         print(f"  Across {len(state_counts)} states")
         print(f"  Top 5 states by prosecutors: {dict(sorted(state_counts.items(), key=lambda x: x[1], reverse=True)[:5])}")
         
@@ -407,72 +697,64 @@ class ProsecutorAnalyzer:
     def match_with_elections(self):
         """Match prosecutors with election data"""
         print_section("MATCHING WITH ELECTION DATA")
-        
-        def match_prosecutor(name):
-            """Try to match a prosecutor name with election records"""
-            name_parts = name.strip().split()
-            if len(name_parts) < 2:
-                return None
-            
-            first_name = name_parts[0]
-            last_name = name_parts[-1]
-            
-            # Strategy 1: Exact first and last name match
-            mask = (self.df_election['cand_fname'].str.lower() == first_name.lower()) & \
-                   (self.df_election['cand_lname'].str.lower() == last_name.lower())
-            matches = self.df_election[mask]
-            
-            # Strategy 2: Last name with first initial
-            if len(matches) == 0:
-                mask = self.df_election['cand_lname'].str.lower() == last_name.lower()
-                matches = self.df_election[mask]
-                if len(matches) > 0:
-                    mask2 = matches['cand_fname'].str[0].str.lower() == first_name[0].lower()
-                    if mask2.sum() > 0:
-                        matches = matches[mask2]
-            
-            return matches if len(matches) > 0 else None
-        
-        # MATCH ALL PROSECUTORS (no rating threshold) for familiarity analyses
+
+        matcher = ElectionMatcher(self.df_election)
+
         print("Creating FULL matched sample (all prosecutors, any # of ratings)...")
         matched_data_all = []
-        
-        for idx, row in self.df_prosecutors.iterrows():
-            matches = match_prosecutor(row['name'])
-            
-            if matches is not None:
-                # Calculate electoral statistics
-                election_stats = {
-                    'num_elections': len(matches),
-                    'years': sorted(matches['election_year'].unique().tolist()),
-                    'ever_contested_primary': matches['primary_contested_reconciled'].eq('contested').any(),
-                    'ever_contested_general': matches['general_contested_reconciled'].eq('contested').any(),
-                    'ever_contested_any': False,  # Will calculate below
-                    'ever_ran_as_incumbent': matches['incum_chall'].eq('I').any(),
-                    'ever_ran_as_challenger': matches['incum_chall'].eq('C').any(),
-                }
-                
-                # Get closest margins
-                primary_margins = matches[matches['winner_primary'] == 'W']['vote_percent_primary'].dropna()
-                general_margins = matches[matches['winner_general'] == 'W']['vote_percent_general'].dropna()
-                
-                election_stats['closest_primary_margin'] = primary_margins.min() if len(primary_margins) > 0 else np.nan
-                election_stats['closest_general_margin'] = general_margins.min() if len(general_margins) > 0 else np.nan
-                election_stats['had_close_primary'] = (primary_margins < Config.CLOSE_MARGIN_THRESHOLD).any() if len(primary_margins) > 0 else False
-                election_stats['had_close_general'] = (general_margins < Config.CLOSE_MARGIN_THRESHOLD).any() if len(general_margins) > 0 else False
-                
-                # Calculate ever_contested_any
-                election_stats['ever_contested_any'] = (
-                    election_stats['ever_contested_primary'] or 
-                    election_stats['ever_contested_general']
-                )
-                
-                # Merge with prosecutor data
-                result = {**row.to_dict(), **election_stats}
-                matched_data_all.append(result)
-        
+        unmatched = []
+
+        for _, row in self.df_prosecutors.iterrows():
+            matches, method, fname_matched = matcher.find_matches(row)
+
+            if matches.empty:
+                unmatched.append(row['name'])
+                continue
+
+            contested_primary = matches['primary_contested_reconciled'].astype(str).str.lower() == 'contested'
+            contested_general = matches['general_contested_reconciled'].astype(str).str.lower() == 'contested'
+            ever_incumbent = matches['incum_chall'].astype(str).str.upper() == 'I'
+            ever_challenger = matches['incum_chall'].astype(str).str.upper() == 'C'
+
+            years = sorted(matches['election_year'].dropna().unique().tolist())
+            primary_margins = pd.to_numeric(matches.loc[matches['winner_primary'] == 'W', 'vote_percent_primary'], errors='coerce').dropna()
+            general_margins = pd.to_numeric(matches.loc[matches['winner_general'] == 'W', 'vote_percent_general'], errors='coerce').dropna()
+
+            if 'election_unique_identifier' in matches.columns:
+                num_elections = matches['election_unique_identifier'].nunique()
+            else:
+                num_elections = int(matches['election_year'].notna().sum())
+
+            election_stats = {
+                'num_elections': int(num_elections),
+                'years': years,
+                'ever_contested_primary': contested_primary.any(),
+                'ever_contested_general': contested_general.any(),
+                'ever_contested_any': contested_primary.any() or contested_general.any(),
+                'ever_ran_as_incumbent': ever_incumbent.any(),
+                'ever_ran_as_challenger': ever_challenger.any(),
+                'closest_primary_margin': primary_margins.min() if len(primary_margins) else np.nan,
+                'closest_general_margin': general_margins.min() if len(general_margins) else np.nan,
+                'had_close_primary': (primary_margins < Config.CLOSE_MARGIN_THRESHOLD).any() if len(primary_margins) else False,
+                'had_close_general': (general_margins < Config.CLOSE_MARGIN_THRESHOLD).any() if len(general_margins) else False,
+                'latest_election_year': max(years) if years else np.nan,
+                'match_method': method,
+                'first_name_compatible': 'Y' if fname_matched else 'N'
+            }
+
+            if 'candidate_unique_identifier' in matches.columns:
+                valid_ids = matches['candidate_unique_identifier'].dropna()
+                if not valid_ids.empty:
+                    election_stats['candidate_unique_identifier'] = valid_ids.iloc[0]
+
+            result = {**row.to_dict(), **election_stats}
+            matched_data_all.append(result)
+
         self.df_matched_all = pd.DataFrame(matched_data_all)
-        
+
+        if unmatched:
+            print(f"⚠ Unmatched prosecutors: {len(unmatched)}")
+
         print(f"✓ FULL matched sample: {len(self.df_matched_all)} prosecutors")
         print(f"  - {len(self.df_matched_all[self.df_matched_all['is_notable']])} notable prosecutors")
         print(f"  - {len(self.df_matched_all[~self.df_matched_all['is_notable']])} state prosecutors")
