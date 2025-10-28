@@ -681,6 +681,22 @@ class ProsecutorAnalyzer:
             return Config.POPULATION_CATEGORY_LABELS['mid']
         return Config.POPULATION_CATEGORY_LABELS['small']
 
+    def _classify_position(self, value):
+        """Map raw position responses into consistent professional groups."""
+
+        if pd.isna(value):
+            return 'Other professionals'
+        text = str(value).strip().lower()
+        if not text:
+            return 'Other professionals'
+        if 'prosecutor' in text or 'district attorney' in text:
+            return 'Prosecutor'
+        if 'defense' in text:
+            return 'Defense Attorney'
+        if 'academic' in text or 'professor' in text:
+            return 'Academic'
+        return 'Other professionals'
+
     def _assign_region(self, state_value):
         if not isinstance(state_value, str) or not state_value:
             return 'Other regions'
@@ -721,6 +737,31 @@ class ProsecutorAnalyzer:
 
         familiarity_rate = (len(substantive_ratings) / total_responses) * 100 if total_responses > 0 else 0
 
+        column_series = self.df_survey[col]
+        very_traditional_count = int((column_series == 'Very Traditional').sum())
+        traditional_count = int((column_series == 'Traditional').sum())
+        progressive_count = int((column_series == 'Progressive').sum())
+        very_progressive_count = int((column_series == 'Very Progressive').sum())
+        not_familiar_count = int((column_series == 'Not Familiar').sum())
+        blank_count = int(column_series.isna().sum())
+
+        # Position-specific means
+        academic_mean = defense_mean = prosecutor_mean = other_mean = np.nan
+        if 'position' in self.df_survey.columns:
+            position_df = pd.DataFrame({
+                'position': self.df_survey['position'],
+                'rating': column_series
+            })
+            position_df['score'] = position_df['rating'].map(Config.RATING_MAP)
+            position_df = position_df.dropna(subset=['score'])
+            if not position_df.empty:
+                position_df['position_group'] = position_df['position'].apply(self._classify_position)
+                group_means = position_df.groupby('position_group')['score'].mean()
+                academic_mean = group_means.get('Academic', np.nan)
+                defense_mean = group_means.get('Defense Attorney', np.nan)
+                prosecutor_mean = group_means.get('Prosecutor', np.nan)
+                other_mean = group_means.get('Other professionals', np.nan)
+
         result = {
             'column': col,
             'name': col_name,
@@ -740,8 +781,27 @@ class ProsecutorAnalyzer:
             'lname': metadata.get('lname'),
             'jurisdiction': metadata.get('jurisdiction'),
             'jurisdiction_clean': metadata.get('jurisdiction_clean'),
-            'is_notable': metadata.get('is_notable', False)
+            'is_notable': metadata.get('is_notable', False),
+            'very_traditional_count': very_traditional_count,
+            'traditional_count': traditional_count,
+            'progressive_count': progressive_count,
+            'very_progressive_count': very_progressive_count,
+            'not_familiar_count': not_familiar_count,
+            'blank_count': blank_count,
+            'academic_mean': academic_mean,
+            'defense_mean': defense_mean,
+            'prosecutor_mean': prosecutor_mean,
+            'other_position_mean': other_mean
         }
+
+        if len(substantive_ratings) > 0:
+            result['very_traditional_pct'] = (very_traditional_count / len(substantive_ratings)) * 100
+            result['traditional_pct'] = (traditional_count / len(substantive_ratings)) * 100
+            result['progressive_pct'] = (progressive_count / len(substantive_ratings)) * 100
+            result['very_progressive_pct'] = (very_progressive_count / len(substantive_ratings)) * 100
+        else:
+            result['very_traditional_pct'] = result['traditional_pct'] = np.nan
+            result['progressive_pct'] = result['very_progressive_pct'] = np.nan
 
         return result
     
@@ -808,8 +868,94 @@ class ProsecutorAnalyzer:
         
         self.results['all_prosecutors'] = self.df_prosecutors
         self.results['prosecutors_filtered_ideology'] = self.df_prosecutors_filtered_ideology
-        
+
+        # Prepare supplemental aggregates used for legacy visualization suite
+        self.build_state_summary()
+        self.build_transition_summary()
+
         return self
+
+    def build_state_summary(self):
+        """Aggregate state-level prosecutor ratings for visualization reuse."""
+
+        state_results = {}
+        for col in self.state_da_cols:
+            meta = self.loader.extract_state_metadata(col)
+            state_key = meta.get('state_source') or meta.get('state_name')
+            if not state_key:
+                continue
+            ratings = self.df_survey[col].map(Config.RATING_MAP).dropna()
+            if ratings.empty:
+                continue
+            bucket = state_results.setdefault(state_key, {
+                'state': state_key,
+                'ratings': [],
+                'prosecutor_count': 0
+            })
+            bucket['ratings'].extend(ratings.tolist())
+            bucket['prosecutor_count'] += 1
+
+        summary_rows = []
+        for state_key, data in state_results.items():
+            arr = np.array(data['ratings'])
+            if len(arr) < Config.MIN_RATINGS_THRESHOLD:
+                continue
+            summary_rows.append({
+                'state': state_key,
+                'n_prosecutors': data['prosecutor_count'],
+                'total_ratings': len(arr),
+                'mean_score': arr.mean(),
+                'median_score': np.median(arr),
+                'std_score': arr.std(ddof=0),
+                'progressive_pct': (arr >= 3).sum() / len(arr) * 100
+            })
+
+        self.state_df = pd.DataFrame(summary_rows).sort_values('mean_score', ascending=False)
+        self.results['state_summary'] = self.state_df
+
+    def build_transition_summary(self):
+        """Recreate jurisdiction transition comparisons used in legacy plots."""
+
+        transitions = [
+            ('notable_5', 'notable_4', 'San Francisco, CA'),
+            ('notable_7', 'notable_6', 'Alameda County, CA'),
+            ('notable_8', 'notable_9', 'Los Angeles, CA'),
+            ('notable_10', 'notable_11', 'Cook County, IL'),
+            ('notable_32', 'notable_33', 'King County, WA'),
+            ('notable_29', 'notable_30', 'Suffolk County, MA'),
+            ('notable_37', 'notable_38', 'Multnomah County, OR'),
+            ('notable_39', 'notable_40', 'Shelby County, TN'),
+            ('notable_26', 'notable_27', 'Harris County, TX'),
+            ('notable_47', 'notable_48', 'Washington, DC'),
+            ('notable_49', 'notable_50', 'Baltimore City, MD')
+        ]
+
+        rows = []
+        for predecessor, successor, jurisdiction in transitions:
+            pred_row = self.df_prosecutors[self.df_prosecutors['column'] == predecessor]
+            succ_row = self.df_prosecutors[self.df_prosecutors['column'] == successor]
+
+            if pred_row.empty or succ_row.empty:
+                continue
+
+            pred_score = pred_row['mean_score'].iloc[0]
+            succ_score = succ_row['mean_score'].iloc[0]
+
+            if pd.isna(pred_score) or pd.isna(succ_score):
+                continue
+
+            rows.append({
+                'Jurisdiction': jurisdiction,
+                'Predecessor': pred_row['name'].iloc[0],
+                'Successor': succ_row['name'].iloc[0],
+                'Pred_Score': pred_score,
+                'Succ_Score': succ_score,
+                'Change': succ_score - pred_score,
+                'Direction': '→ Progressive' if succ_score - pred_score > 0 else '→ Traditional'
+            })
+
+        self.transitions_df = pd.DataFrame(rows).sort_values('Change')
+        self.results['transitions'] = self.transitions_df
     
     def match_with_elections(self):
         """Match prosecutors with election data"""
@@ -1704,6 +1850,34 @@ class IntegratedReporter:
         plt.savefig(path, dpi=200, bbox_inches='tight')
         plt.close()
 
+    def _prepare_notable_df(self):
+        df = self.analyzer.df_prosecutors.copy()
+        if df.empty:
+            return df
+        df = df[df['is_notable']].copy()
+        if df.empty:
+            return df
+        df['Name'] = df['name']
+        df['Location'] = df['location']
+        df['Mean_Score'] = df['mean_score']
+        df['Median_Score'] = df['median_score']
+        df['Std_Dev'] = df['std_score']
+        df['Substantive_Ratings'] = df['substantive_ratings']
+        df['Familiarity_Rate'] = df['familiarity_rate']
+        df['Academic_Mean'] = df['academic_mean']
+        df['Defense_Mean'] = df['defense_mean']
+        df['Prosecutor_Mean'] = df['prosecutor_mean']
+        df['Very_Progressive_Pct'] = df['very_progressive_pct']
+        df['Very_Traditional_Pct'] = df['very_traditional_pct']
+        df['Progressive_Pct'] = df['progressive_pct']
+        df['Traditional_Pct'] = df['traditional_pct']
+        df['Column'] = df['column']
+        return df
+
+    def _prepare_state_df(self):
+        state_df = getattr(self.analyzer, 'state_df', pd.DataFrame()).copy()
+        return state_df if state_df is not None else pd.DataFrame()
+
     def generate_visualizations(self):
         print_section("GENERATING EXTENDED VISUALIZATIONS")
         df = self.analyzer.df_prosecutors.copy()
@@ -1813,7 +1987,629 @@ class IntegratedReporter:
         except Exception as exc:
             print(f"[Viz] Recall context failed: {exc}")
 
+        # Legacy visualization suite (top-to-bottom from prior scripts)
+        self.generate_legacy_visualizations()
+        self.generate_additional_rankings()
+        self.generate_election_visualizations()
+        self.generate_tier1_visualization()
+
         return self
+
+    def generate_legacy_visualizations(self):
+        notable_df = self._prepare_notable_df()
+        state_df = self._prepare_state_df()
+        viz_dir = Path(self.config.VIZ_DIR)
+
+        if notable_df.empty:
+            print("[Viz] No notable prosecutors available for legacy charts")
+            return
+
+        try:
+            self._viz_rankings_top20(notable_df, viz_dir)
+            print("✓ Legacy viz_1_rankings.png saved")
+        except Exception as exc:
+            print(f"[Viz] Legacy rankings failed: {exc}")
+
+        try:
+            self._viz_all_notables(notable_df, viz_dir)
+            print("✓ Legacy viz_2_all_50_das.png saved")
+        except Exception as exc:
+            print(f"[Viz] Legacy all-notables failed: {exc}")
+
+        try:
+            self._viz_position_effects(notable_df, viz_dir)
+            print("✓ Legacy viz_3_position_effects.png saved")
+        except Exception as exc:
+            print(f"[Viz] Position effects failed: {exc}")
+
+        try:
+            self._viz_familiarity_crisis(notable_df, viz_dir)
+            print("✓ Legacy viz_4_familiarity.png saved")
+        except Exception as exc:
+            print(f"[Viz] Familiarity crisis failed: {exc}")
+
+        try:
+            if hasattr(self.analyzer, 'transitions_df') and not self.analyzer.transitions_df.empty:
+                self._viz_transitions(self.analyzer.transitions_df, viz_dir)
+                print("✓ Legacy viz_5_transitions.png saved")
+        except Exception as exc:
+            print(f"[Viz] Transitions failed: {exc}")
+
+        try:
+            self._viz_controversy(notable_df, viz_dir)
+            print("✓ Legacy viz_6_controversy.png saved")
+        except Exception as exc:
+            print(f"[Viz] Controversy viz failed: {exc}")
+
+        try:
+            self._viz_geographic(notable_df, viz_dir)
+            print("✓ Legacy viz_7_geographic.png saved")
+        except Exception as exc:
+            print(f"[Viz] Geographic viz failed: {exc}")
+
+        try:
+            if not state_df.empty:
+                self._viz_national_vs_state(notable_df, state_df, viz_dir)
+                print("✓ Legacy viz_8_national_vs_state.png saved")
+        except Exception as exc:
+            print(f"[Viz] National vs state failed: {exc}")
+
+    def generate_additional_rankings(self):
+        notable_df = self._prepare_notable_df()
+        viz_dir = Path(self.config.VIZ_DIR)
+        if notable_df.empty:
+            return
+
+        try:
+            reliable = notable_df[notable_df['Substantive_Ratings'] >= 30].copy()
+            if reliable.empty:
+                return
+            top10 = reliable.nlargest(10, 'Mean_Score')
+            bottom10 = reliable.nsmallest(10, 'Mean_Score')
+
+            plt.figure(figsize=(7, 5))
+            plt.barh(top10['Name'], top10['Mean_Score'], color=plt.cm.RdYlGn((top10['Mean_Score'] - 1) / 3))
+            plt.gca().invert_yaxis()
+            plt.xlabel('Mean Ideology Score (4=Very Progressive)')
+            plt.title('Top 10 Progressive (Notables)')
+            self._savefig(viz_dir / 'rankings_top10_progressive.png')
+
+            plt.figure(figsize=(7, 5))
+            plt.barh(bottom10['Name'], bottom10['Mean_Score'], color=plt.cm.RdYlGn((bottom10['Mean_Score'] - 1) / 3))
+            plt.gca().invert_yaxis()
+            plt.xlabel('Mean Ideology Score (1=Very Traditional)')
+            plt.title('Bottom 10 (Most Traditional) — Notables')
+            self._savefig(viz_dir / 'rankings_bottom10_traditional.png')
+
+            plt.figure(figsize=(6, 4))
+            plt.hist(notable_df['Familiarity_Rate'].dropna(), bins=20, color='#1f77b4', alpha=0.8)
+            plt.xlabel('Familiarity Rate (%)')
+            plt.ylabel('Count of Notables')
+            plt.title('Familiarity Distribution — Notables')
+            self._savefig(viz_dir / 'familiarity_notables_hist.png')
+
+            state_df = self.analyzer.df_prosecutors[~self.analyzer.df_prosecutors['is_notable']]
+            if not state_df.empty:
+                plt.figure(figsize=(6, 4))
+                plt.hist(state_df['familiarity_rate'].dropna(), bins=20, color='#ff7f0e', alpha=0.8)
+                plt.xlabel('Familiarity Rate (%)')
+                plt.ylabel('Count of State DAs')
+                plt.title('Familiarity Distribution — State DAs')
+                self._savefig(viz_dir / 'familiarity_states_hist.png')
+
+            transitions = getattr(self.analyzer, 'transitions_df', pd.DataFrame())
+            if not transitions.empty:
+                for _, row in transitions.iterrows():
+                    plt.figure(figsize=(5, 4))
+                    plt.plot([0, 1], [row['Pred_Score'], row['Succ_Score']], marker='o')
+                    plt.xticks([0, 1], [row['Predecessor'], row['Successor']], rotation=0)
+                    plt.ylabel('Mean Ideology Score (1–4)')
+                    plt.title(f"Transition: {row['Predecessor']} → {row['Successor']}\n{row['Jurisdiction']}")
+                    plt.ylim(1, 4)
+                    plt.grid(True, axis='y', linestyle='--', alpha=0.5)
+                    fname = re.sub(r"[^a-z0-9]+", "_", row['Predecessor'].split()[-1].lower())
+                    tname = re.sub(r"[^a-z0-9]+", "_", row['Successor'].split()[-1].lower())
+                    self._savefig(viz_dir / f'transition_{fname}_to_{tname}.png')
+        except Exception as exc:
+            print(f"[Viz] Additional rankings failed: {exc}")
+
+    def generate_election_visualizations(self):
+        df = getattr(self.analyzer, 'df_matched_all', pd.DataFrame()).copy()
+        if df.empty:
+            return
+
+        viz_dir = Path(self.config.VIZ_DIR)
+        df['had_close_any'] = df['had_close_primary'] | df['had_close_general']
+
+        try:
+            notable = df[df['is_notable'] & (df['num_elections'] > 0)]
+            if not notable.empty:
+                fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+                contested = [
+                    notable[notable['ever_contested_any']]['familiarity_rate'],
+                    notable[~notable['ever_contested_any']]['familiarity_rate']
+                ]
+                axes[0].boxplot(contested, labels=['Ever Contested', 'Never Contested'])
+                axes[0].set_ylabel('Familiarity Rate (%)')
+                axes[0].set_title('Contested Elections (Any)\nNotable Prosecutors', fontweight='bold')
+                axes[0].grid(axis='y', alpha=0.3)
+
+                close = [
+                    notable[notable['had_close_any']]['familiarity_rate'],
+                    notable[~notable['had_close_any']]['familiarity_rate']
+                ]
+                axes[1].boxplot(close, labels=['Had Close Race', 'No Close Race'])
+                axes[1].set_ylabel('Familiarity Rate (%)')
+                axes[1].set_title('Close Elections (Margin < 55%)\nNotable Prosecutors', fontweight='bold')
+                axes[1].grid(axis='y', alpha=0.3)
+                self._savefig(viz_dir / 'familiarity_elections_notable.png')
+        except Exception as exc:
+            print(f"[Viz] Notable election viz failed: {exc}")
+
+        try:
+            state = df[(~df['is_notable']) & (df['num_elections'] > 0)]
+            if len(state) > 5:
+                fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+                contested = [
+                    state[state['ever_contested_any']]['familiarity_rate'],
+                    state[~state['ever_contested_any']]['familiarity_rate']
+                ]
+                axes[0].boxplot(contested, labels=['Ever Contested', 'Never Contested'])
+                axes[0].set_ylabel('Familiarity Rate (%)')
+                axes[0].set_title('Contested Elections (Any)\nState Prosecutors', fontweight='bold')
+                axes[0].grid(axis='y', alpha=0.3)
+
+                close = [
+                    state[state['had_close_any']]['familiarity_rate'],
+                    state[~state['had_close_any']]['familiarity_rate']
+                ]
+                axes[1].boxplot(close, labels=['Had Close Race', 'No Close Race'])
+                axes[1].set_ylabel('Familiarity Rate (%)')
+                axes[1].set_title('Close Elections (Margin < 55%)\nState Prosecutors', fontweight='bold')
+                axes[1].grid(axis='y', alpha=0.3)
+                self._savefig(viz_dir / 'familiarity_elections_state.png')
+        except Exception as exc:
+            print(f"[Viz] State election viz failed: {exc}")
+
+        try:
+            notable = df[df['is_notable'] & (df['num_elections'] > 0)]
+            if not notable.empty:
+                fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+                # Primary margin scatter
+                ax = axes[0]
+                primary_mask = notable['closest_primary_margin'].notna()
+                if primary_mask.sum() > 2:
+                    ax.scatter(notable.loc[primary_mask, 'closest_primary_margin'],
+                               notable.loc[primary_mask, 'familiarity_rate'],
+                               alpha=0.6, s=80, color='steelblue')
+                    x = notable.loc[primary_mask, 'closest_primary_margin']
+                    y = notable.loc[primary_mask, 'familiarity_rate']
+                    coef = np.polyfit(x, y, 1)
+                    ax.plot(x, np.poly1d(coef)(x), 'r--', alpha=0.8, linewidth=2)
+                ax.set_xlabel('Closest Primary Margin (%)')
+                ax.set_ylabel('Familiarity Rate (%)')
+                ax.set_title('Primary Election Competitiveness\nvs Familiarity', fontweight='bold')
+                ax.grid(alpha=0.3)
+
+                ax = axes[1]
+                general_mask = notable['closest_general_margin'].notna()
+                if general_mask.sum() > 2:
+                    ax.scatter(notable.loc[general_mask, 'closest_general_margin'],
+                               notable.loc[general_mask, 'familiarity_rate'],
+                               alpha=0.6, s=80, color='darkgreen')
+                    x = notable.loc[general_mask, 'closest_general_margin']
+                    y = notable.loc[general_mask, 'familiarity_rate']
+                    coef = np.polyfit(x, y, 1)
+                    ax.plot(x, np.poly1d(coef)(x), 'r--', alpha=0.8, linewidth=2)
+                ax.set_xlabel('Closest General Margin (%)')
+                ax.set_ylabel('Familiarity Rate (%)')
+                ax.set_title('General Election Competitiveness\nvs Familiarity', fontweight='bold')
+                ax.grid(alpha=0.3)
+
+                self._savefig(viz_dir / 'margin_familiarity_scatter.png')
+        except Exception as exc:
+            print(f"[Viz] Margin scatter viz failed: {exc}")
+
+    def generate_tier1_visualization(self):
+        df = getattr(self.analyzer, 'df_matched_all', pd.DataFrame()).copy()
+        if df.empty:
+            return
+
+        viz_dir = Path(self.config.VIZ_DIR)
+        try:
+            notable = df[df['is_notable']]
+            state = df[~df['is_notable']]
+
+            challengers = notable[notable['ever_ran_as_challenger']]
+            incumbents = notable[notable['ever_ran_as_incumbent']]
+            state_challengers = state[state['ever_ran_as_challenger']]
+            state_incumbents = state[state['ever_ran_as_incumbent']]
+
+            notable_with_elections = notable[notable['num_elections'] > 0]
+            state_with_elections = state[state['num_elections'] > 0]
+
+            prog = df[df['is_progressive']]
+            trad = df[df['is_traditional']]
+
+            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+            axes[0, 0].boxplot([challengers['familiarity_rate'], incumbents['familiarity_rate']],
+                               labels=['Challenger', 'Incumbent'])
+            axes[0, 0].set_ylabel('Familiarity Rate (%)')
+            axes[0, 0].set_title('RQ3: Notable Prosecutors\nChallenger vs. Incumbent', fontweight='bold')
+            axes[0, 0].grid(axis='y', alpha=0.3)
+
+            axes[0, 1].boxplot([state_challengers['familiarity_rate'], state_incumbents['familiarity_rate']],
+                               labels=['Challenger', 'Incumbent'])
+            axes[0, 1].set_ylabel('Familiarity Rate (%)')
+            axes[0, 1].set_title('RQ3: State Prosecutors\nChallenger vs. Incumbent', fontweight='bold')
+            axes[0, 1].grid(axis='y', alpha=0.3)
+
+            ax = axes[0, 2]
+            ax.scatter(notable_with_elections['num_elections'], notable_with_elections['familiarity_rate'], alpha=0.6, s=80)
+            if len(notable_with_elections) > 1:
+                x = notable_with_elections['num_elections']
+                y = notable_with_elections['familiarity_rate']
+                coef = np.polyfit(x, y, 1)
+                x_line = np.linspace(x.min(), x.max(), 100)
+                ax.plot(x_line, np.poly1d(coef)(x_line), 'r--', alpha=0.8, linewidth=2)
+            ax.set_xlabel('Number of Elections')
+            ax.set_ylabel('Familiarity Rate (%)')
+            ax.set_title('RQ4: Notable Prosecutors\nElections vs. Familiarity', fontweight='bold')
+            ax.grid(alpha=0.3)
+
+            ax = axes[1, 0]
+            ax.scatter(state_with_elections['num_elections'], state_with_elections['familiarity_rate'], alpha=0.4, s=60)
+            if len(state_with_elections) > 1:
+                x = state_with_elections['num_elections']
+                y = state_with_elections['familiarity_rate']
+                coef = np.polyfit(x, y, 1)
+                x_line = np.linspace(x.min(), x.max(), 100)
+                ax.plot(x_line, np.poly1d(coef)(x_line), 'r--', alpha=0.8, linewidth=2)
+            ax.set_xlabel('Number of Elections')
+            ax.set_ylabel('Familiarity Rate (%)')
+            ax.set_title('RQ4: State Prosecutors\nElections vs. Familiarity', fontweight='bold')
+            ax.grid(alpha=0.3)
+
+            prog_data = [
+                prog[prog['ever_contested_primary']]['familiarity_rate'],
+                prog[~prog['ever_contested_primary']]['familiarity_rate'],
+                prog[prog['ever_contested_general']]['familiarity_rate'],
+                prog[~prog['ever_contested_general']]['familiarity_rate']
+            ]
+            axes[1, 1].boxplot(prog_data, positions=[1, 2, 4, 5])
+            axes[1, 1].set_xticks([1, 2, 4, 5])
+            axes[1, 1].set_xticklabels(['Cont.\nPrim', 'Uncont.\nPrim', 'Cont.\nGen', 'Uncont.\nGen'])
+            axes[1, 1].set_ylabel('Familiarity Rate (%)')
+            axes[1, 1].set_title('RQ5: Progressive Prosecutors\nPrimary vs. General Effects', fontweight='bold')
+            axes[1, 1].grid(axis='y', alpha=0.3)
+
+            trad_data = [
+                trad[trad['ever_contested_primary']]['familiarity_rate'],
+                trad[~trad['ever_contested_primary']]['familiarity_rate'],
+                trad[trad['ever_contested_general']]['familiarity_rate'],
+                trad[~trad['ever_contested_general']]['familiarity_rate']
+            ]
+            axes[1, 2].boxplot(trad_data, positions=[1, 2, 4, 5])
+            axes[1, 2].set_xticks([1, 2, 4, 5])
+            axes[1, 2].set_xticklabels(['Cont.\nPrim', 'Uncont.\nPrim', 'Cont.\nGen', 'Uncont.\nGen'])
+            axes[1, 2].set_ylabel('Familiarity Rate (%)')
+            axes[1, 2].set_title('RQ5: Traditional Prosecutors\nPrimary vs. General Effects', fontweight='bold')
+            axes[1, 2].grid(axis='y', alpha=0.3)
+
+            plt.tight_layout()
+            plt.savefig(viz_dir / 'tier1_research_questions.png', dpi=200, bbox_inches='tight')
+            plt.close()
+        except Exception as exc:
+            print(f"[Viz] Tier1 visualization failed: {exc}")
+
+    # ------------------------------------------------------------------
+    # Legacy visualization helpers
+    # ------------------------------------------------------------------
+
+    def _viz_rankings_top20(self, notable_df, viz_dir):
+        reliable = notable_df[notable_df['Substantive_Ratings'] >= 30].copy()
+        if reliable.empty:
+            return
+        top20 = reliable.sort_values('Mean_Score', ascending=False).head(20)
+
+        fig, ax = plt.subplots(figsize=(12, 10))
+        y_pos = np.arange(len(top20))
+        colors = plt.cm.RdYlGn((top20['Mean_Score'] - 1) / 3)
+        ax.barh(y_pos, top20['Mean_Score'], color=colors, alpha=0.8)
+        for i, (_, row) in enumerate(top20.iterrows()):
+            ax.text(row['Mean_Score'] + 0.05, i, f"{row['Mean_Score']:.2f}", va='center', fontweight='bold', fontsize=9)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels([f"{row['Name']} ({row['Location']})" for _, row in top20.iterrows()], fontsize=10)
+        ax.set_xlabel('Progressiveness Score (1-4 Scale)', fontweight='bold', fontsize=11)
+        ax.set_title('Top 20 Most Progressive District Attorneys', fontweight='bold', fontsize=14, pad=20)
+        ax.set_xlim(1, 4)
+        ax.axvline(x=2.5, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+        ax.invert_yaxis()
+        ax.grid(axis='x', alpha=0.3)
+        self._savefig(viz_dir / 'viz_1_rankings.png')
+
+    def _viz_all_notables(self, notable_df, viz_dir):
+        reliable = notable_df[notable_df['Substantive_Ratings'] >= 10].copy()
+        if reliable.empty:
+            return
+        reliable = reliable.sort_values('Mean_Score', ascending=False)
+
+        fig, ax = plt.subplots(figsize=(16, 14))
+        y_pos = np.arange(len(reliable))
+        colors = plt.cm.RdYlGn((reliable['Mean_Score'] - 1) / 3)
+        ax.barh(y_pos, reliable['Mean_Score'], color=colors, alpha=0.7)
+        for i, (_, row) in enumerate(reliable.iterrows()):
+            ax.text(row['Mean_Score'] + 0.05, i, f"{row['Mean_Score']:.2f} (n={int(row['Substantive_Ratings'])})",
+                    va='center', fontsize=8)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels([f"{row['Name']} ({row['Location']})" for _, row in reliable.iterrows()], fontsize=9)
+        ax.set_xlabel('Progressiveness Score (1-4 Scale)', fontweight='bold', fontsize=12)
+        ax.set_title('Complete Rankings: 50 Notable District Attorneys', fontweight='bold', fontsize=16, pad=20)
+        ax.set_xlim(1, 4)
+        ax.axvline(x=2.5, color='gray', linestyle='--', alpha=0.5, linewidth=1, label='Midpoint (2.5)')
+        ax.axvline(x=3, color='green', linestyle='--', alpha=0.5, linewidth=1, label='Progressive Threshold (≥3)')
+        ax.invert_yaxis()
+        ax.grid(axis='x', alpha=0.3)
+        ax.legend(loc='lower right')
+        self._savefig(viz_dir / 'viz_2_all_50_das.png')
+
+    def _viz_position_effects(self, notable_df, viz_dir):
+        reliable = notable_df[
+            (notable_df['Substantive_Ratings'] >= 30) &
+            notable_df['Academic_Mean'].notna() &
+            notable_df['Defense_Mean'].notna() &
+            notable_df['Prosecutor_Mean'].notna()
+        ].copy()
+        if reliable.empty:
+            return
+        top = reliable.sort_values('Substantive_Ratings', ascending=False).head(15)
+
+        fig, ax = plt.subplots(figsize=(14, 10))
+        x = np.arange(len(top))
+        width = 0.25
+        ax.bar(x - width, top['Academic_Mean'], width, label='Academic', color='#3498db', alpha=0.8)
+        ax.bar(x, top['Defense_Mean'], width, label='Defense Attorney', color='#e74c3c', alpha=0.8)
+        ax.bar(x + width, top['Prosecutor_Mean'], width, label='Prosecutor', color='#2ecc71', alpha=0.8)
+        ax.set_ylabel('Mean Progressiveness Score', fontweight='bold', fontsize=11)
+        ax.set_title('How Different Professionals Rate the Same Prosecutors', fontweight='bold', fontsize=14, pad=20)
+        ax.set_xticks(x)
+        ax.set_xticklabels(top['Name'], rotation=45, ha='right', fontsize=9)
+        ax.legend(loc='upper right', fontsize=10)
+        ax.set_ylim(1, 4)
+        ax.axhline(y=2.5, color='gray', linestyle='--', alpha=0.3)
+        ax.grid(axis='y', alpha=0.3)
+        self._savefig(viz_dir / 'viz_3_position_effects.png')
+
+    def _viz_familiarity_crisis(self, notable_df, viz_dir):
+        reliable = notable_df[notable_df['Substantive_Ratings'] >= 10].copy()
+        if reliable.empty:
+            return
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+
+        top20 = reliable.nlargest(20, 'Familiarity_Rate')
+        y_pos = np.arange(len(top20))
+        ax1.barh(y_pos, top20['Familiarity_Rate'], color='#3498db', alpha=0.7)
+        for i, (_, row) in enumerate(top20.iterrows()):
+            ax1.text(row['Familiarity_Rate'] + 1, i, f"{row['Familiarity_Rate']:.0f}%", va='center', fontsize=8)
+        ax1.set_yticks(y_pos)
+        ax1.set_yticklabels(top20['Name'], fontsize=9)
+        ax1.set_xlabel('Familiarity Rate (%)', fontweight='bold')
+        ax1.set_title('Top 20 Most Familiar Prosecutors', fontweight='bold', fontsize=12)
+        ax1.invert_yaxis()
+        ax1.grid(axis='x', alpha=0.3)
+
+        scatter_df = reliable[reliable['Substantive_Ratings'] >= 30]
+        scatter = ax2.scatter(scatter_df['Familiarity_Rate'], scatter_df['Mean_Score'],
+                              c=scatter_df['Mean_Score'], cmap='RdYlGn', s=100, alpha=0.6, vmin=1, vmax=4)
+        for _, row in scatter_df.head(10).iterrows():
+            ax2.annotate(row['Name'], (row['Familiarity_Rate'], row['Mean_Score']),
+                         xytext=(5, 5), textcoords='offset points', fontsize=7, alpha=0.7)
+        ax2.set_xlabel('Familiarity Rate (%)', fontweight='bold')
+        ax2.set_ylabel('Mean Progressiveness Score', fontweight='bold')
+        ax2.set_title('Familiarity vs Progressiveness', fontweight='bold', fontsize=12)
+        ax2.grid(alpha=0.3)
+        ax2.set_ylim(1, 4)
+        plt.colorbar(scatter, ax=ax2, label='Progressiveness')
+
+        plt.tight_layout()
+        plt.savefig(viz_dir / 'viz_4_familiarity.png', dpi=200, bbox_inches='tight')
+        plt.close()
+
+    def _viz_transitions(self, transitions_df, viz_dir):
+        if transitions_df.empty:
+            return
+        fig, ax = plt.subplots(figsize=(14, 10))
+        ordered = transitions_df.sort_values('Change')
+        y_pos = np.arange(len(ordered))
+        colors = ['#e74c3c' if x < 0 else '#2ecc71' for x in ordered['Change']]
+        ax.barh(y_pos, ordered['Change'], color=colors, alpha=0.7)
+        for i, (_, row) in enumerate(ordered.iterrows()):
+            label = f"{row['Predecessor']} → {row['Successor']}\n{row['Jurisdiction']}"
+            ax.text(-0.1, i, label, va='center', ha='right', fontsize=9)
+            offset = 0.05 if row['Change'] > 0 else -0.05
+            ha = 'left' if row['Change'] > 0 else 'right'
+            ax.text(row['Change'] + offset, i, f"{row['Change']:+.2f}", va='center', ha=ha, fontweight='bold', fontsize=9)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels([''] * len(ordered))
+        ax.set_xlabel('Change in Progressiveness Score', fontweight='bold', fontsize=12)
+        ax.set_title('Electoral Transitions: How Jurisdictions Shifted', fontweight='bold', fontsize=14, pad=20)
+        ax.axvline(x=0, color='black', linestyle='-', linewidth=1)
+        ax.grid(axis='x', alpha=0.3)
+        ax.set_xlim(-3, 1)
+        traditional_patch = mpatches.Patch(color='#e74c3c', alpha=0.7, label='Shift toward Traditional')
+        progressive_patch = mpatches.Patch(color='#2ecc71', alpha=0.7, label='Shift toward Progressive')
+        ax.legend(handles=[traditional_patch, progressive_patch], loc='lower right')
+        self._savefig(viz_dir / 'viz_5_transitions.png')
+
+    def _viz_controversy(self, notable_df, viz_dir):
+        reliable = notable_df[notable_df['Substantive_Ratings'] >= 30].copy()
+        if reliable.empty:
+            return
+        most_controversial = reliable.nlargest(15, 'Std_Dev')
+        fig, ax = plt.subplots(figsize=(14, 10))
+        y_pos = np.arange(len(most_controversial))
+        colors = plt.cm.RdYlGn((most_controversial['Mean_Score'] - 1) / 3)
+        ax.barh(y_pos, most_controversial['Std_Dev'], color=colors, alpha=0.7)
+        for i, (_, row) in enumerate(most_controversial.iterrows()):
+            ax.text(row['Std_Dev'] + 0.02, i, f"σ={row['Std_Dev']:.2f} | μ={row['Mean_Score']:.2f}", va='center', fontsize=9)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels([f"{row['Name']} ({row['Location']})" for _, row in most_controversial.iterrows()], fontsize=10)
+        ax.set_xlabel('Standard Deviation (Disagreement)', fontweight='bold', fontsize=11)
+        ax.set_title('Most Controversial Prosecutors: Highest Disagreement in Ratings', fontweight='bold', fontsize=14, pad=20)
+        ax.invert_yaxis()
+        ax.grid(axis='x', alpha=0.3)
+        ax.text(0.95, 0.05,
+                'Bar color indicates mean score\nRed = Traditional, Yellow = Moderate, Green = Progressive',
+                transform=ax.transAxes, fontsize=9, va='bottom', ha='right',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        self._savefig(viz_dir / 'viz_6_controversy.png')
+
+    def _viz_geographic(self, notable_df, viz_dir):
+        state_counts = {}
+        for _, row in notable_df.iterrows():
+            location = row['Location']
+            if isinstance(location, str) and ', ' in location:
+                state = location.split(', ')[-1]
+                bucket = state_counts.setdefault(state, {'count': 0, 'total_score': 0.0, 'scores': []})
+                bucket['count'] += 1
+                if not pd.isna(row['Mean_Score']):
+                    bucket['total_score'] += row['Mean_Score']
+                    bucket['scores'].append(row['Mean_Score'])
+
+        summary = []
+        for state, data in state_counts.items():
+            avg = np.nan
+            if data['count'] > 0 and data['scores']:
+                avg = np.mean(data['scores'])
+            summary.append({'state': state, 'n_das': data['count'], 'avg_score': avg})
+
+        state_df = pd.DataFrame(summary).sort_values('n_das', ascending=False).head(15)
+        if state_df.empty:
+            return
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+        y_pos = np.arange(len(state_df))
+        ax1.barh(y_pos, state_df['n_das'], color='#3498db', alpha=0.7)
+        for i, (_, row) in enumerate(state_df.iterrows()):
+            ax1.text(row['n_das'] + 0.1, i, f"{row['n_das']}", va='center', fontsize=10)
+        ax1.set_yticks(y_pos)
+        ax1.set_yticklabels(state_df['state'], fontsize=11)
+        ax1.set_xlabel('Number of Prosecutors in National Sample', fontweight='bold')
+        ax1.set_title('States with Most Prosecutors in Study', fontweight='bold', fontsize=12)
+        ax1.invert_yaxis()
+        ax1.grid(axis='x', alpha=0.3)
+
+        scored = state_df[state_df['avg_score'].notna()].sort_values('avg_score', ascending=False)
+        y_pos2 = np.arange(len(scored))
+        ax2.barh(y_pos2, scored['avg_score'], color=plt.cm.RdYlGn((scored['avg_score'] - 1) / 3), alpha=0.7)
+        for i, (_, row) in enumerate(scored.iterrows()):
+            ax2.text(row['avg_score'] + 0.02, i, f"{row['avg_score']:.2f}", va='center', fontsize=9)
+        ax2.set_yticks(y_pos2)
+        ax2.set_yticklabels(scored['state'], fontsize=11)
+        ax2.set_xlabel('Average Progressiveness Score', fontweight='bold')
+        ax2.set_title('Average Progressiveness by State', fontweight='bold', fontsize=12)
+        ax2.invert_yaxis()
+        ax2.grid(axis='x', alpha=0.3)
+        self._savefig(viz_dir / 'viz_7_geographic.png')
+
+    def _viz_national_vs_state(self, notable_df, state_df, viz_dir):
+        reliable_national = notable_df[notable_df['Substantive_Ratings'] >= Config.MIN_RATINGS_THRESHOLD]
+        if reliable_national.empty or state_df.empty:
+            return
+
+        national_mean = reliable_national['Mean_Score'].mean()
+        state_mean = state_df['mean_score'].mean()
+
+        fig = plt.figure(figsize=(18, 12))
+        gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
+
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax1.hist(reliable_national['Mean_Score'], bins=20, alpha=0.6,
+                 color='#e74c3c', label=f'National DAs (μ={national_mean:.2f})', edgecolor='black')
+        state_scores = []
+        for _, row in state_df.iterrows():
+            weight = max(int(row['total_ratings'] / 10), 1)
+            state_scores.extend([row['mean_score']] * weight)
+        if state_scores:
+            ax1.hist(state_scores, bins=20, alpha=0.6,
+                     color='#3498db', label=f'State DAs (μ={state_mean:.2f})', edgecolor='black')
+        ax1.set_xlabel('Progressiveness Score', fontweight='bold')
+        ax1.set_ylabel('Frequency', fontweight='bold')
+        ax1.set_title('Score Distribution: National vs State', fontweight='bold', fontsize=13)
+        ax1.legend()
+        ax1.grid(alpha=0.3)
+        ax1.set_xlim(1, 4)
+
+        ax2 = fig.add_subplot(gs[0, 1])
+        nat_prog = len(reliable_national[reliable_national['Mean_Score'] >= 3])
+        nat_trad = len(reliable_national[reliable_national['Mean_Score'] <= 2])
+        nat_mod = len(reliable_national) - nat_prog - nat_trad
+        state_prog = len(state_df[state_df['mean_score'] >= 3])
+        state_trad = len(state_df[state_df['mean_score'] <= 2])
+        state_mod = len(state_df) - state_prog - state_trad
+        x = np.arange(3)
+        width = 0.35
+        nat_counts = np.array([nat_trad, nat_mod, nat_prog], dtype=float)
+        state_counts = np.array([state_trad, state_mod, state_prog], dtype=float)
+        nat_pct = (nat_counts / len(reliable_national) * 100) if len(reliable_national) else np.zeros(3)
+        state_pct = (state_counts / len(state_df) * 100) if len(state_df) else np.zeros(3)
+        ax2.bar(x - width / 2, nat_pct, width, label='National DAs', color='#e74c3c', alpha=0.7)
+        ax2.bar(x + width / 2, state_pct, width, label='State DAs', color='#3498db', alpha=0.7)
+        ax2.set_ylabel('Percentage', fontweight='bold')
+        ax2.set_title('Ideological Distribution', fontweight='bold', fontsize=13)
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(['Traditional\n(≤2)', 'Moderate\n(>2,<3)', 'Progressive\n(≥3)'])
+        ax2.legend()
+        ax2.grid(axis='y', alpha=0.3)
+
+        ax3 = fig.add_subplot(gs[1, 0])
+        top10 = reliable_national.nlargest(10, 'Mean_Score')
+        y_pos = np.arange(len(top10))
+        ax3.barh(y_pos, top10['Mean_Score'], color=plt.cm.RdYlGn((top10['Mean_Score'] - 1) / 3), alpha=0.7)
+        for i, (_, row) in enumerate(top10.iterrows()):
+            ax3.text(row['Mean_Score'] + 0.05, i, f"{row['Mean_Score']:.2f}", va='center', fontsize=8)
+        ax3.set_yticks(y_pos)
+        ax3.set_yticklabels(top10['Name'], fontsize=9)
+        ax3.set_xlabel('Progressiveness Score', fontweight='bold')
+        ax3.set_title('Top 10 National DAs', fontweight='bold', fontsize=13)
+        ax3.invert_yaxis()
+        ax3.grid(axis='x', alpha=0.3)
+        ax3.set_xlim(1, 4)
+
+        ax4 = fig.add_subplot(gs[1, 1])
+        ax4.axis('off')
+        gap = national_mean - state_mean
+        gap_pct = (gap / 3) * 100
+        most_known = reliable_national.nlargest(1, 'Familiarity_Rate')
+        if not most_known.empty:
+            most_known_name = most_known['Name'].iloc[0]
+            most_known_pct = most_known['Familiarity_Rate'].iloc[0]
+        else:
+            most_known_name = 'N/A'
+            most_known_pct = np.nan
+        avg_unfam = 100 - reliable_national['Familiarity_Rate'].mean()
+        summary_text = f"""
+**KEY FINDINGS & OBSERVATIONS:**
+
+**1. National vs. State Gap**
+   • **National DAs:** Rated at **{national_mean:.2f}**
+   • **State-Level DAs:** Rated at **{state_mean:.2f}**
+   • **Gap:** **{gap:.2f}** points (~{gap_pct:.0f}% of scale)
+
+**2. Familiarity Concentration**
+   • Average unfamiliarity with national DAs: {avg_unfam:.0f}%
+   • Most known: {most_known_name} ({most_known_pct:.0f}%)
+"""
+        ax4.text(0.05, 0.95, summary_text, transform=ax4.transAxes,
+                 fontsize=11, verticalalignment='top',
+                 bbox=dict(boxstyle='round,pad=0.5', facecolor='#f0f0f0', alpha=0.8))
+
+        plt.suptitle('The Two-Tier System of Prosecutor Perception: National vs. State',
+                     fontsize=16, fontweight='bold', y=0.98)
+        plt.savefig(viz_dir / 'viz_8_national_vs_state.png', dpi=200, bbox_inches='tight')
+        plt.close()
 
     def _familiarity_breakdown(self):
         df = self.analyzer.df_survey.copy()
