@@ -1737,6 +1737,11 @@ class ProsecutorAnalyzer:
         print(f"Adjusted R²: {model1.rsquared_adj:.3f}")
         
         self.results['familiarity_model_electoral'] = model1
+        self.results['familiarity_model_electoral_meta'] = {
+            'n': int(model1.nobs),
+            'notable_n': int(df1['is_notable'].sum()),
+            'state_n': int((~df1['is_notable']).sum())
+        }
         
         # ========================================================================
         # MODEL 2: Add Ideology - Uses FILTERED matched sample
@@ -1786,6 +1791,11 @@ class ProsecutorAnalyzer:
         print(f"Adjusted R²: {model2.rsquared_adj:.3f}")
         
         self.results['familiarity_model_with_ideology'] = model2
+        self.results['familiarity_model_with_ideology_meta'] = {
+            'n': int(model2.nobs),
+            'notable_n': int(df2['is_notable'].sum()),
+            'state_n': int((~df2['is_notable']).sum())
+        }
         
         # ========================================================================
         # INTERPRETATION
@@ -1853,7 +1863,23 @@ class ProsecutorAnalyzer:
             f.write("1. Notable prosecutor familiarity = substantive_ratings / 407 (completed national section)\n")
             f.write("2. State prosecutor familiarity = substantive_ratings / state_respondents_who_engaged\n")
             f.write("3. Scale corrected to 1-4 (Very Traditional to Very Progressive)\n")
-            f.write("4. TWO regression models: Model 1 (electoral, n=191) & Model 2 (with ideology, n=51)\n\n")
+            model1_meta = self.results.get('familiarity_model_electoral_meta')
+            model2_meta = self.results.get('familiarity_model_with_ideology_meta')
+            if model1_meta and model2_meta:
+                share_notable = (model2_meta['notable_n'] / model2_meta['n'] * 100) if model2_meta['n'] else 0
+                f.write(
+                    "4. Regression models recalculated on matched datasets: "
+                    f"Model 1 (electoral factors) uses n={model1_meta['n']} "
+                    f"(notable={model1_meta['notable_n']}, state={model1_meta['state_n']}); "
+                    f"Model 2 (adds ideology) uses n={model2_meta['n']} "
+                    f"({share_notable:.1f}% notable).\n\n"
+                )
+            elif model1_meta:
+                f.write(
+                    f"4. Regression model (electoral factors) uses the full matched sample (n={model1_meta['n']}).\n\n"
+                )
+            else:
+                f.write("4. Regression models run only when matched election data are available.\n\n")
             f.write("METHODOLOGY:\n")
             f.write("-" * 80 + "\n")
             f.write(f"Total initiated: 496\n")
@@ -1872,7 +1898,9 @@ class ProsecutorAnalyzer:
             
             if 'familiarity_model_electoral' in self.results:
                 model1 = self.results['familiarity_model_electoral']
-                f.write("MODEL 1: FAMILIARITY DRIVERS (Electoral Factors, n=191):\n")
+                meta1 = self.results.get('familiarity_model_electoral_meta', {})
+                n1 = meta1.get('n', int(model1.nobs))
+                f.write(f"MODEL 1: FAMILIARITY DRIVERS (Electoral Factors, n={n1}):\n")
                 f.write("-" * 80 + "\n")
                 f.write(f"R² = {model1.rsquared:.3f}\n")
                 f.write(f"State vs Notable: β={model1.params['is_notable']:.2f}, p={model1.pvalues['is_notable']:.4f}\n")
@@ -1882,12 +1910,26 @@ class ProsecutorAnalyzer:
             
             if 'familiarity_model_with_ideology' in self.results:
                 model2 = self.results['familiarity_model_with_ideology']
-                f.write("MODEL 2: FAMILIARITY + IDEOLOGY (n=51, 94% notable):\n")
+                meta2 = self.results.get('familiarity_model_with_ideology_meta', {})
+                n2 = meta2.get('n', int(model2.nobs))
+                notable_n = meta2.get('notable_n')
+                share_notable = (notable_n / n2 * 100) if (notable_n is not None and n2) else None
+                state_n = meta2.get('state_n')
+                f.write(f"MODEL 2: FAMILIARITY + IDEOLOGY (n={n2}")
+                if share_notable is not None:
+                    f.write(f", {share_notable:.1f}% notable")
+                f.write("):\n")
                 f.write("-" * 80 + "\n")
                 f.write(f"R² = {model2.rsquared:.3f}\n")
                 f.write(f"Progressiveness: β={model2.params['mean_score']:.2f}, p={model2.pvalues['mean_score']:.4f}\n")
                 f.write(f"Contested General: β={model2.params['ever_contested_general']:.2f}, p={model2.pvalues['ever_contested_general']:.4f}\n")
-                f.write("Note: is_notable coefficient unreliable due to only 3 state prosecutors\n\n")
+                if state_n is not None:
+                    f.write(
+                        f"Note: is_notable coefficient unstable due to only {state_n} state prosecutor"
+                        f"{'s' if state_n != 1 else ''} in this filtered sample\n\n"
+                    )
+                else:
+                    f.write("Note: is_notable coefficient unstable because the filtered sample is overwhelmingly notable prosecutors.\n\n")
             
             if 'top_10' in self.results.get('familiarity_comparison', {}):
                 f.write("TOP 10 PROSECUTORS BY FAMILIARITY:\n")
