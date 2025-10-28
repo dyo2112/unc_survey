@@ -843,7 +843,7 @@ class ProsecutorAnalyzer:
         print(f"✓ Processed {len([p for p in all_prosecutors if not p.get('is_notable')])} state prosecutors")
         print(f"  Across {len(state_counts)} states")
         print(f"  Top 5 states by prosecutors: {dict(sorted(state_counts.items(), key=lambda x: x[1], reverse=True)[:5])}")
-        
+
         self.df_prosecutors = pd.DataFrame(all_prosecutors)
         
         print(f"\n✓ Created dataset with {len(self.df_prosecutors)} prosecutors")
@@ -872,6 +872,22 @@ class ProsecutorAnalyzer:
         # Prepare supplemental aggregates used for legacy visualization suite
         self.build_state_summary()
         self.build_transition_summary()
+
+        # Store composition breakdowns for master reporting
+        if 'position' in self.df_survey.columns:
+            position_series = self.df_survey['position'].apply(self._classify_position)
+            position_map = {
+                'Prosecutor': 'Prosecutors',
+                'Defense Attorney': 'Defense Attorneys',
+                'Academic': 'Academics'
+            }
+            mapped_positions = position_series.map(lambda x: position_map.get(x, 'Other Criminal Justice Professionals'))
+            position_counts = mapped_positions.value_counts().to_dict()
+        else:
+            position_counts = {}
+
+        self.results['position_breakdown'] = position_counts
+        self.results['state_prosecutor_counts'] = state_counts
 
         return self
 
@@ -1066,14 +1082,36 @@ class ProsecutorAnalyzer:
 
         self.df_matched_all['is_progressive'] = self.df_matched_all['name'].isin(Config.PROGRESSIVE_NAMES)
         self.df_matched_all['is_traditional'] = self.df_matched_all['name'].isin(Config.TRADITIONAL_NAMES)
-        
+
         # Add recalled indicator
         self.df_matched['recalled'] = self.df_matched['name'].isin(Config.RECALLED_PROSECUTORS)
         self.df_matched_all['recalled'] = self.df_matched_all['name'].isin(Config.RECALLED_PROSECUTORS)
-        
+
         self.results['matched_all'] = self.df_matched_all
         self.results['matched_filtered'] = self.df_matched
-        
+
+        # Summaries for integration rates
+        total_notable = int(self.df_prosecutors['is_notable'].sum())
+        total_state = int((~self.df_prosecutors['is_notable']).sum())
+        matched_notable = int(self.df_matched_all[self.df_matched_all['is_notable']].shape[0])
+        matched_state = int(self.df_matched_all[~self.df_matched_all['is_notable']].shape[0])
+        unmatched_set = set(unmatched)
+        notable_names = set(self.df_prosecutors[self.df_prosecutors['is_notable']]['name'])
+        state_names = set(self.df_prosecutors[~self.df_prosecutors['is_notable']]['name'])
+        unmatched_notables = sorted(name for name in unmatched_set if name in notable_names)
+        unmatched_states = sorted(name for name in unmatched_set if name in state_names)
+
+        self.results['matching_summary'] = {
+            'total_notable': total_notable,
+            'matched_notable': matched_notable,
+            'match_rate_notable': matched_notable / total_notable if total_notable else np.nan,
+            'total_state': total_state,
+            'matched_state': matched_state,
+            'match_rate_state': matched_state / total_state if total_state else np.nan,
+            'unmatched_notables': unmatched_notables,
+            'unmatched_states': unmatched_states
+        }
+
         return self
     
     def analyze_familiarity_patterns(self):
@@ -1139,23 +1177,32 @@ class ProsecutorAnalyzer:
 
         incumbents = df[df['ever_ran_as_incumbent']]
         challengers = df[df['ever_ran_as_challenger']]
-        
+
         print("INCUMBENCY VS CHALLENGER:")
         print(f"  Ever ran as incumbent: {len(incumbents)} prosecutors")
         print(f"    Mean familiarity: {incumbents['familiarity_rate'].mean():.2f}%")
         print(f"  Ever ran as challenger: {len(challengers)} prosecutors")
         print(f"    Mean familiarity: {challengers['familiarity_rate'].mean():.2f}%")
-        
+
+        inc_mean = incumbents['familiarity_rate'].mean() if len(incumbents) > 0 else np.nan
+        chal_mean = challengers['familiarity_rate'].mean() if len(challengers) > 0 else np.nan
+        diff = inc_mean - chal_mean if pd.notna(inc_mean) and pd.notna(chal_mean) else np.nan
+        t_stat = p_val = np.nan
         if len(incumbents) > 0 and len(challengers) > 0:
-            t_stat, p_val = ttest_ind(incumbents['familiarity_rate'], 
+            t_stat, p_val = ttest_ind(incumbents['familiarity_rate'],
                                      challengers['familiarity_rate'])
             print(f"  T-test: t={t_stat:.3f}, p={p_val:.4f}")
             if p_val < 0.05:
                 print("  *** SIGNIFICANT DIFFERENCE ***")
-        
+
         self.results['incumbency_analysis'] = {
-            'incumbent_mean': incumbents['familiarity_rate'].mean() if len(incumbents) > 0 else np.nan,
-            'challenger_mean': challengers['familiarity_rate'].mean() if len(challengers) > 0 else np.nan
+            'incumbent_mean': inc_mean,
+            'challenger_mean': chal_mean,
+            'difference': diff,
+            'incumbent_count': len(incumbents),
+            'challenger_count': len(challengers),
+            't_stat': t_stat,
+            'p_val': p_val
         }
 
         return self
@@ -1193,8 +1240,20 @@ class ProsecutorAnalyzer:
                 't_stat': t_stat,
                 'p_val': p_val
             }
+
+            if len(df_ideology) > 2:
+                corr_r, corr_p = pearsonr(df_ideology['mean_score'], df_ideology['familiarity_rate'])
+            else:
+                corr_r = corr_p = np.nan
+
+            results['familiarity_progressiveness_corr'] = {
+                'sample_size': len(df_ideology),
+                'pearson_r': corr_r,
+                'pearson_p': corr_p
+            }
         else:
             results['bivariate_pattern'] = None
+            results['familiarity_progressiveness_corr'] = None
 
         # ------------------------------------------------------------------
         # National notable prosecutors: contested vs uncontested general elections
@@ -1559,22 +1618,29 @@ class ProsecutorAnalyzer:
         
         contested = df[df['ever_contested_any']]
         uncontested = df[~df['ever_contested_any']]
-        
+
         print(f"  Ever contested (n={len(contested)}): {contested['familiarity_rate'].mean():.2f}%")
         print(f"  Never contested (n={len(uncontested)}): {uncontested['familiarity_rate'].mean():.2f}%")
-        
+
+        t_stat = p_val = np.nan
         if len(contested) > 0 and len(uncontested) > 0:
-            t_stat, p_val = ttest_ind(contested['familiarity_rate'], 
+            t_stat, p_val = ttest_ind(contested['familiarity_rate'],
                                      uncontested['familiarity_rate'])
             print(f"  T-test: t={t_stat:.3f}, p={p_val:.4f}")
             if p_val < 0.05:
                 print("  *** SIGNIFICANT DIFFERENCE ***")
-        
+
         self.results['contestation_analysis'] = {
             'contested_mean': contested['familiarity_rate'].mean() if len(contested) > 0 else np.nan,
-            'uncontested_mean': uncontested['familiarity_rate'].mean() if len(uncontested) > 0 else np.nan
+            'uncontested_mean': uncontested['familiarity_rate'].mean() if len(uncontested) > 0 else np.nan,
+            'difference': (contested['familiarity_rate'].mean() - uncontested['familiarity_rate'].mean())
+                          if len(contested) > 0 and len(uncontested) > 0 else np.nan,
+            'contested_count': len(contested),
+            'uncontested_count': len(uncontested),
+            't_stat': t_stat,
+            'p_val': p_val
         }
-        
+
         return self
     
     def analyze_recall_risk(self):
@@ -2799,6 +2865,20 @@ class IntegratedReporter:
             )
         lines.append("")
 
+        corr = results.get('familiarity_progressiveness_corr') or {}
+        lines.append("Overall Familiarity-Progressiveness Correlation")
+        lines.append("-" * 100)
+        if corr:
+            lines.append(
+                f"Sample size: {corr.get('sample_size', 0)} prosecutors with ideology & familiarity"
+            )
+            lines.append(
+                f"Pearson r = {fmt_num(corr.get('pearson_r'))}; p = {fmt_num(corr.get('pearson_p'))}"
+            )
+        else:
+            lines.append("Insufficient data for correlation estimate.")
+        lines.append("")
+
         national = results.get('national_contestation') or {}
         lines.append("Electoral Competition and Prosecutor Visibility")
         lines.append("-" * 100)
@@ -2815,11 +2895,20 @@ class IntegratedReporter:
         lines.append(
             f"Difference: {fmt_num(national.get('difference'))} percentage points; Welch’s t ≈ {fmt_num(national.get('t_stat'))} (p = {fmt_num(national.get('p_val'))})"
         )
-        lines.append("Interpretation: ??")
+        nat_diff = national.get('difference')
+        if nat_diff is None or pd.isna(nat_diff):
+            nat_interp = "Insufficient data to compare contested versus uncontested general elections."
+        elif nat_diff > 0:
+            nat_interp = "Contested general elections correspond with higher familiarity among notable prosecutors."
+        elif nat_diff < 0:
+            nat_interp = "Contested general elections correspond with lower familiarity among notable prosecutors."
+        else:
+            nat_interp = "Contested status shows no average familiarity difference among notable prosecutors."
+        lines.append(f"Interpretation: {nat_interp}")
         lines.append("")
 
         state = results.get('state_contestation') or {}
-        lines.append("The State Pattern: Contested Races affect Familiarity ??")
+        lines.append("The State Pattern: Contested Races and Familiarity")
         lines.append("~" * 100)
         lines.append(
             f"Uncontested General Elections: mean familiarity {fmt_num(state.get('uncontested_mean'))}% — Prosecutors: {state.get('uncontested_count', 0)} (of {state.get('total_with_data', 0)} with election data)"
@@ -2844,8 +2933,32 @@ class IntegratedReporter:
         lines.append(
             f"Correlation between primary margin and familiarity among state-level prosecutors (where a primary margin exists): r ≈ {fmt_num(state.get('primary_margin_corr'))} (p = {fmt_num(state.get('primary_margin_p'))})"
         )
-        lines.append("Interpretation: ??")
+        state_diff = state.get('difference')
+        if state_diff is None or pd.isna(state_diff):
+            state_interp = "Insufficient data to compare contested versus uncontested general elections for state prosecutors."
+        elif state_diff > 0:
+            state_interp = "Contested general elections correspond with higher familiarity among state-level prosecutors."
+        elif state_diff < 0:
+            state_interp = "State-level familiarity is slightly lower when prosecutors face contested general elections."
+        else:
+            state_interp = "General election contestation shows no meaningful familiarity difference among state prosecutors."
+        lines.append(f"Interpretation: {state_interp}")
         lines.append("")
+
+        overall = self.analyzer.results.get('contestation_analysis') or {}
+        if overall:
+            lines.append("Overall Contestation Effects (All Matched Prosecutors)")
+            lines.append("-" * 100)
+            lines.append(
+                f"Ever contested any election (n={overall.get('contested_count', 0)}): mean familiarity {fmt_num(overall.get('contested_mean'))}%"
+            )
+            lines.append(
+                f"Never contested (n={overall.get('uncontested_count', 0)}): mean familiarity {fmt_num(overall.get('uncontested_mean'))}%"
+            )
+            lines.append(
+                f"Difference: {fmt_num(overall.get('difference'))} pp; t ≈ {fmt_num(overall.get('t_stat'))} (p = {fmt_num(overall.get('p_val'))})"
+            )
+            lines.append("")
 
         logistic = results.get('logistic_close_victory') or {}
         lines.append("Predictive Model: What Predicts Close Victory?")
@@ -2962,7 +3075,7 @@ class IntegratedReporter:
             f"Progressive prosecutors (score ≥2.5) concentrated in: California {geo.get('progressive_top10_ca', 0)} of top 10 most progressive; Major cities {geo.get('progressive_top10_major_city', 0)}; Blue states {geo.get('progressive_biden_states', 0)} of {geo.get('progressive_total', 0)}"
         )
         lines.append(
-            f"Traditional prosecutors (score <2.5) concentrated in: Southern states {geo.get('traditional_southern_states', 0)}; Red states {geo.get('traditional_trump_states', 0)} of {geo.get('traditional_total', 0)}; Suburban/exurban counties even within blue states ??"
+            f"Traditional prosecutors (score <2.5) concentrated in: Southern states {geo.get('traditional_southern_states', 0)}; Red states {geo.get('traditional_trump_states', 0)} of {geo.get('traditional_total', 0)}; Suburban/exurban county counts limited in source data"
         )
         lines.append("")
 
@@ -2970,6 +3083,228 @@ class IntegratedReporter:
         report_path.write_text("\n".join(lines), encoding='utf-8')
         print(f"✓ Extended visibility & competition report saved -> {report_path}")
         return report_path
+
+    def produce_unified_master_report(self, summary_path=None, visibility_path=None, rq_path=None):
+        """Create a single consolidated text report for the narrative write-up."""
+
+        print_section("WRITING MASTER REPORT DIGEST")
+
+        def fmt_num(value, digits=2):
+            return f"{value:.{digits}f}" if value is not None and pd.notna(value) else "N/A"
+
+        def fmt_pct(value, digits=1):
+            return f"{value:.{digits}f}%" if value is not None and pd.notna(value) else "N/A"
+
+        def fmt_ratio(value, digits=1):
+            return f"{value*100:.{digits}f}%" if value is not None and pd.notna(value) else "N/A"
+
+        def add_section(title, width=90):
+            lines.append(title)
+            lines.append("-" * min(len(title), width))
+
+        analyzer = self.analyzer
+        results = analyzer.results
+
+        lines = []
+        lines.append("=" * 100)
+        lines.append("MASTER FINDINGS REPORT DIGEST")
+        lines.append("=" * 100)
+        lines.append("")
+
+        add_section("Data Overview")
+        lines.append(f"Total respondents after consent: {analyzer.total_respondents}")
+        lines.append(f"Completed national section: {analyzer.completed_national_section}")
+        lines.append(f"Total prosecutors analyzed: {len(analyzer.df_prosecutors)}")
+        state_counts = results.get('state_prosecutor_counts', {}) or {}
+        if state_counts:
+            top_states = sorted(state_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+            state_text = ", ".join([f"{state}: {count}" for state, count in top_states])
+            lines.append(f"Top states by number of rated prosecutors: {state_text}")
+        position_counts = results.get('position_breakdown', {}) or {}
+        if position_counts:
+            lines.append("Respondent professional composition:")
+            for label, count in sorted(position_counts.items(), key=lambda x: x[1], reverse=True):
+                lines.append(f"  {label}: {count}")
+        lines.append("")
+
+        matching = results.get('matching_summary', {}) or {}
+        add_section("Electoral Data Integration")
+        if matching:
+            lines.append(f"Notable prosecutors matched: {matching.get('matched_notable', 0)} of {matching.get('total_notable', 0)} ({fmt_ratio(matching.get('match_rate_notable'))})")
+            lines.append(f"State prosecutors matched: {matching.get('matched_state', 0)} of {matching.get('total_state', 0)} ({fmt_ratio(matching.get('match_rate_state'))})")
+            if matching.get('unmatched_notables'):
+                lines.append("Unmatched notable prosecutors: " + ", ".join(matching['unmatched_notables']))
+            if matching.get('unmatched_states'):
+                lines.append("Unmatched state prosecutors (sample): " + ", ".join(matching['unmatched_states'][:10]))
+        else:
+            lines.append("Electoral matching summary unavailable.")
+        lines.append("")
+
+        fam = results.get('familiarity_comparison', {}) or {}
+        add_section("Familiarity Patterns")
+        if fam:
+            lines.append(f"Mean familiarity — Notables: {fmt_num(fam.get('notable_mean'))}% | State: {fmt_num(fam.get('state_mean'))}%")
+            lines.append(f"Difference (Notable − State): {fmt_num(fam.get('difference'))} pp (t = {fmt_num(fam.get('t_stat'))}, p = {fmt_num(fam.get('p_val'))})")
+            top_df = fam.get('top_10')
+            if isinstance(top_df, pd.DataFrame) and not top_df.empty:
+                lines.append("Top 5 prosecutors by familiarity rate:")
+                top5 = top_df.sort_values('familiarity_rate', ascending=False).head(5)
+                for _, row in top5.iterrows():
+                    lines.append(f"  {row['name']} — Familiarity {row['familiarity_rate']:.1f}% | Mean ideology {row['mean_score']:.2f}")
+        else:
+            lines.append("Familiarity comparison unavailable.")
+        lines.append("")
+
+        vis_results = results.get('visibility_competition', {}) or {}
+        add_section("Familiarity, Ideology, and Competition")
+        bivariate = vis_results.get('bivariate_pattern') or {}
+        if bivariate:
+            lines.append(f"Familiarity >30%: mean ideology {fmt_num(bivariate.get('high_mean'))} (n={bivariate.get('high_count', 0)})")
+            lines.append(f"Familiarity <10%: mean ideology {fmt_num(bivariate.get('low_mean'))} (n={bivariate.get('low_count', 0)})")
+            lines.append(f"Difference: {fmt_num(bivariate.get('difference'))} points (Welch’s t = {fmt_num(bivariate.get('t_stat'))}, p = {fmt_num(bivariate.get('p_val'))})")
+        corr = vis_results.get('familiarity_progressiveness_corr') or {}
+        if corr:
+            lines.append(f"Pearson correlation (familiarity vs ideology): r = {fmt_num(corr.get('pearson_r'))} (p = {fmt_num(corr.get('pearson_p'))}, n = {corr.get('sample_size', 0)})")
+        national = vis_results.get('national_contestation') or {}
+        if national:
+            lines.append(f"Notable contested general elections: familiarity {fmt_num(national.get('contested_mean'))}% (n={national.get('contested_count', 0)})")
+            lines.append(f"Notable uncontested general elections: familiarity {fmt_num(national.get('uncontested_mean'))}% (n={national.get('uncontested_count', 0)})")
+            lines.append(f"Difference: {fmt_num(national.get('difference'))} pp (t = {fmt_num(national.get('t_stat'))}, p = {fmt_num(national.get('p_val'))})")
+        state = vis_results.get('state_contestation') or {}
+        if state:
+            lines.append(f"State contested general elections: familiarity {fmt_num(state.get('contested_mean'))}% (n={state.get('contested_count', 0)})")
+            lines.append(f"State uncontested general elections: familiarity {fmt_num(state.get('uncontested_mean'))}% (n={state.get('uncontested_count', 0)})")
+            lines.append(f"Difference: {fmt_num(state.get('difference'))} pp (t = {fmt_num(state.get('t_stat'))}, p = {fmt_num(state.get('p_val'))})")
+            lines.append(f"Close primary vs not close: {fmt_num(state.get('close_primary_mean'))}% vs {fmt_num(state.get('not_close_primary_mean'))}% (Δ = {fmt_num(state.get('close_primary_diff'))} pp)")
+            lines.append(f"Primary margin correlation with familiarity: r = {fmt_num(state.get('primary_margin_corr'))} (p = {fmt_num(state.get('primary_margin_p'))})")
+        overall_contestation = results.get('contestation_analysis') or {}
+        if overall_contestation:
+            lines.append(f"Ever contested any election: familiarity {fmt_num(overall_contestation.get('contested_mean'))}% (n={overall_contestation.get('contested_count', 0)})")
+            lines.append(f"Never contested: familiarity {fmt_num(overall_contestation.get('uncontested_mean'))}% (n={overall_contestation.get('uncontested_count', 0)})")
+            lines.append(f"Difference: {fmt_num(overall_contestation.get('difference'))} pp (t = {fmt_num(overall_contestation.get('t_stat'))}, p = {fmt_num(overall_contestation.get('p_val'))})")
+        lines.append("")
+
+        add_section("Incumbency and Challenger Pathways")
+        incumbency = results.get('incumbency_analysis') or {}
+        if incumbency:
+            lines.append(f"Incumbents (n={incumbency.get('incumbent_count', 0)}): familiarity {fmt_num(incumbency.get('incumbent_mean'))}%")
+            lines.append(f"Challengers (n={incumbency.get('challenger_count', 0)}): familiarity {fmt_num(incumbency.get('challenger_mean'))}%")
+            lines.append(f"Difference: {fmt_num(incumbency.get('difference'))} pp (t = {fmt_num(incumbency.get('t_stat'))}, p = {fmt_num(incumbency.get('p_val'))})")
+        logistic = vis_results.get('logistic_close_victory') or {}
+        if logistic:
+            lines.append(f"Close victories (<{self.config.CLOSE_MARGIN_THRESHOLD}% margin): {logistic.get('close_victories', 0)} of {logistic.get('sample_size', 0)} ({fmt_ratio(logistic.get('close_share'))})")
+            model = logistic.get('model')
+            if model is not None:
+                for param in ['ever_ran_as_challenger', 'mean_score', 'ever_contested_primary']:
+                    if param in model.params:
+                        lines.append(f"  {param.replace('_', ' ').title()}: β = {fmt_num(model.params[param])} (p = {fmt_num(model.pvalues[param])})")
+        pathway = vis_results.get('vulnerability_pathway') or {}
+        if pathway:
+            lines.append(f"Progressive challengers: {fmt_ratio(pathway.get('progressive_challenger_rate'))} vs non-progressive {fmt_ratio(pathway.get('non_progressive_challenger_rate'))}")
+            lines.append(f"Challenger margin difference (closest general): {fmt_num(pathway.get('challenger_margin_difference'))} pp")
+            model = pathway.get('challenger_model')
+            if model is not None and 'mean_score' in model.params:
+                lines.append(f"  Logistic regression (challenger ~ ideology): β = {fmt_num(model.params['mean_score'])} (p = {fmt_num(model.pvalues['mean_score'])})")
+        lines.append("")
+
+        ideology = vis_results.get('contestation_by_ideology') or {}
+        add_section("Contestation by Ideology")
+        if ideology:
+            counts = ideology.get('counts', {}) or {}
+            lines.append("Counts: " + ", ".join([f"{k}={v}" for k, v in counts.items()]))
+            primary_rates = ideology.get('primary_rates', {}) or {}
+            general_rates = ideology.get('general_rates', {}) or {}
+            lines.append(f"Primary contestation — Progressive: {fmt_ratio(primary_rates.get('Progressive'))} | Traditional: {fmt_ratio(primary_rates.get('Traditional'))}")
+            chi_primary = ideology.get('chi_primary')
+            if chi_primary:
+                if primary_rates.get('Progressive') is not None and primary_rates.get('Traditional') is not None:
+                    primary_diff = primary_rates.get('Progressive') - primary_rates.get('Traditional')
+                    diff_text = fmt_ratio(primary_diff)
+                else:
+                    diff_text = "N/A"
+                lines.append(f"  Difference: {diff_text} (χ² = {fmt_num(chi_primary[0])}, p = {fmt_num(chi_primary[1])})")
+            lines.append(f"General contestation — Progressive: {fmt_ratio(general_rates.get('Progressive'))} | Traditional: {fmt_ratio(general_rates.get('Traditional'))}")
+            chi_general = ideology.get('chi_general')
+            if chi_general:
+                if general_rates.get('Progressive') is not None and general_rates.get('Traditional') is not None:
+                    general_diff = general_rates.get('Progressive') - general_rates.get('Traditional')
+                    general_diff_text = fmt_ratio(general_diff)
+                else:
+                    general_diff_text = "N/A"
+                lines.append(f"  Difference: {general_diff_text} (χ² = {fmt_num(chi_general[0])}, p = {fmt_num(chi_general[1])})")
+        else:
+            lines.append("Ideology contestation breakdown unavailable.")
+        lines.append("")
+
+        rater = vis_results.get('rater_position_scores') or {}
+        add_section("Mean Ideology Ratings by Rater Position")
+        means = rater.get('means', {}) or {}
+        if means:
+            lines.append(f"Prosecutors rating prosecutors: {fmt_num(means.get('Prosecutors rating prosecutors'))}")
+            lines.append(f"Academics rating prosecutors: {fmt_num(means.get('Academics rating prosecutors'))}")
+            lines.append(f"Defense attorneys rating prosecutors: {fmt_num(means.get('Defense attorneys rating prosecutors'))}")
+            lines.append(f"Other professionals rating prosecutors: {fmt_num(means.get('Other professionals'))}")
+            if rater.get('anova_f') is not None:
+                lines.append(f"ANOVA F({fmt_num(rater.get('anova_df1'), 0)}, {fmt_num(rater.get('anova_df2'), 0)}) = {fmt_num(rater.get('anova_f'))}, p = {fmt_num(rater.get('anova_p'))}")
+        else:
+            lines.append("Rater position differences unavailable.")
+        lines.append("")
+
+        regional = vis_results.get('regional_patterns') or {}
+        add_section("Regional Patterns")
+        means = regional.get('means') or {}
+        if means:
+            for region, value in means.items():
+                lines.append(f"{region}: {fmt_num(value)}")
+            lines.append(f"ANOVA F({fmt_num(regional.get('anova_df1'), 0)}, {fmt_num(regional.get('anova_df2'), 0)}) = {fmt_num(regional.get('anova_f'))}, p = {fmt_num(regional.get('anova_p'))}")
+        else:
+            lines.append("Regional comparisons unavailable.")
+        lines.append("")
+
+        urban = vis_results.get('urban_rural') or {}
+        add_section("Urban vs. Rural (Notable Prosecutors)")
+        means = urban.get('means') or {}
+        if means:
+            for label, value in means.items():
+                lines.append(f"{label}: {fmt_num(value)}")
+            lines.append(f"Population correlation r = {fmt_num(urban.get('population_correlation'))} (p = {fmt_num(urban.get('population_corr_p'))})")
+        else:
+            lines.append("Urban/rural breakdown unavailable.")
+        lines.append("")
+
+        geo = vis_results.get('geographic_concentration') or {}
+        add_section("Geographic Concentration of Progressive vs Traditional Prosecutors")
+        if geo:
+            lines.append(f"Progressive prosecutors (≥2.5): total {geo.get('progressive_total', 0)}, California share {geo.get('progressive_top10_ca', 0)} of top 10, major city count {geo.get('progressive_top10_major_city', 0)}, located in Biden 2020 states {geo.get('progressive_biden_states', 0)}")
+            lines.append(f"Traditional prosecutors (<2.5): total {geo.get('traditional_total', 0)}, southern states {geo.get('traditional_southern_states', 0)}, located in Trump 2020 states {geo.get('traditional_trump_states', 0)}")
+        else:
+            lines.append("Geographic concentration metrics unavailable.")
+        lines.append("")
+
+        add_section("Appended Detailed Sections")
+        append_targets = [
+            ('CORRECTED_FINDINGS_SUMMARY.txt', Path(self.config.OUTPUT_DIR) / 'CORRECTED_FINDINGS_SUMMARY.txt'),
+            ('INTEGRATED_MASTER_SUMMARY.txt', summary_path),
+            ('EXTENDED_VISIBILITY_COMPETITION.txt', visibility_path),
+            ('INTEGRATED_RESEARCH_QUESTIONS.txt', rq_path)
+        ]
+        for label, path in append_targets:
+            if isinstance(path, (str, Path)):
+                path_obj = Path(path)
+            else:
+                path_obj = None
+            if path_obj and path_obj.exists():
+                lines.append("")
+                lines.append("=" * 90)
+                lines.append(f"APPENDIX: {label}")
+                lines.append("=" * 90)
+                content = path_obj.read_text(encoding='utf-8').strip()
+                lines.append(content)
+
+        master_path = Path(self.config.OUTPUT_DIR) / 'MASTER_REPORT_FULL.txt'
+        master_path.write_text("\n".join(lines), encoding='utf-8')
+        print(f"✓ Unified master report saved -> {master_path}")
+        return master_path
 
     def run_research_questions(self):
         print_section("RUNNING RESEARCH QUESTIONS (TIER 1)")
@@ -3039,7 +3374,8 @@ class IntegratedReporter:
         summary_path = self.produce_extended_summary()
         visibility_path = self.produce_visibility_competition_report()
         rq_path = self.run_research_questions()
-        return summary_path, visibility_path, rq_path
+        master_path = self.produce_unified_master_report(summary_path, visibility_path, rq_path)
+        return summary_path, visibility_path, rq_path, master_path
 
 
 
@@ -3098,12 +3434,14 @@ def main():
 
     # Extended integrated outputs
     reporter = IntegratedReporter(analyzer)
-    summary_path, visibility_path, rq_path = reporter.export_all()
+    summary_path, visibility_path, rq_path, master_path = reporter.export_all()
     print(f"\nExtended summary: {summary_path}")
     if visibility_path:
         print(f"Visibility & competition report: {visibility_path}")
     if rq_path:
         print(f"Research questions report: {rq_path}")
+    if master_path:
+        print(f"Unified master report: {master_path}")
 
     print_section("✅ CORRECTED ANALYSIS COMPLETE!", "=")
     print(f"All outputs saved to: {Config.OUTPUT_DIR}/")
@@ -3115,6 +3453,9 @@ def main():
     print("     - matched_prosecutors_FILTERED_CORRECTED.csv")
     print("     - CORRECTED_FINDINGS_SUMMARY.txt")
     print("     - EXTENDED_VISIBILITY_COMPETITION.txt")
+    print("     - INTEGRATED_MASTER_SUMMARY.txt")
+    print("     - INTEGRATED_RESEARCH_QUESTIONS.txt")
+    print("     - MASTER_REPORT_FULL.txt")
     print("\n" + "="*80)
     print("\n🎯 NEXT STEPS:")
     print("1. Review CORRECTED_FINDINGS_SUMMARY.txt for key changes")
