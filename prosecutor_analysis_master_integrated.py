@@ -972,7 +972,87 @@ class ProsecutorAnalyzer:
 
         self.transitions_df = pd.DataFrame(rows).sort_values('Change')
         self.results['transitions'] = self.transitions_df
-    
+
+    def _determine_entry_route(self, matches: pd.DataFrame) -> str:
+        """Derive a mutually exclusive entry route category from election records."""
+
+        if matches is None or matches.empty:
+            return 'Unknown'
+
+        ordered = matches.copy()
+        if 'election_year' in ordered.columns:
+            ordered['election_year'] = pd.to_numeric(ordered['election_year'], errors='coerce')
+            ordered = ordered.dropna(subset=['election_year']).sort_values('election_year')
+
+        if ordered.empty:
+            return 'Unknown'
+
+        first_row = ordered.iloc[0]
+        inc_chall = str(first_row.get('incum_chall', '')).strip().upper()
+
+        if inc_chall == 'I':
+            return 'Incumbent'
+        if inc_chall == 'C':
+            return 'Challenger'
+        if inc_chall == 'O':
+            return 'Open'
+
+        # Fall back on any available information if the first election is missing labels
+        ever_incumbent = (matches.get('incum_chall', pd.Series(dtype=str)).astype(str).str.upper() == 'I').any()
+        ever_challenger = (matches.get('incum_chall', pd.Series(dtype=str)).astype(str).str.upper() == 'C').any()
+
+        if ever_challenger and not ever_incumbent:
+            return 'Challenger'
+        if ever_incumbent and not ever_challenger:
+            return 'Incumbent'
+
+        return 'Appointed/Other'
+
+    def _fit_familiarity_glm(self, df: pd.DataFrame, covariates: list[str], label: str):
+        """Fit a binomial GLM for familiarity using numerator/denominator counts."""
+
+        if df is None or df.empty:
+            print(f"⚠ No observations available for {label}")
+            return None, pd.DataFrame()
+
+        work = df.copy()
+        work['total_responses'] = pd.to_numeric(work['total_responses'], errors='coerce')
+        work['substantive_ratings'] = pd.to_numeric(work['substantive_ratings'], errors='coerce')
+        work = work[(work['total_responses'] > 0) & (work['substantive_ratings'] >= 0)]
+
+        if work.empty:
+            print(f"⚠ No valid familiarity denominators for {label}")
+            return None, pd.DataFrame()
+
+        X = work[covariates].copy()
+        for col in covariates:
+            if col not in X.columns:
+                print(f"⚠ Missing covariate '{col}' for {label}; dropping model")
+                return None, pd.DataFrame()
+            if X[col].dtype == bool:
+                X[col] = X[col].astype(int)
+        X = X.apply(pd.to_numeric, errors='coerce')
+
+        mask = X.notna().all(axis=1)
+        work = work[mask]
+        X = X[mask]
+
+        if work.empty:
+            print(f"⚠ No complete cases for {label}")
+            return None, pd.DataFrame()
+
+        X = sm.add_constant(X, has_constant='add')
+        y = work['substantive_ratings'] / work['total_responses']
+        weights = work['total_responses']
+
+        try:
+            model = sm.GLM(y, X, family=sm.families.Binomial(), freq_weights=weights).fit()
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"⚠ Binomial GLM failed for {label}: {exc}")
+            return None, work
+
+        return model, work
+
     def match_with_elections(self):
         """Match prosecutors with election data"""
         print_section("MATCHING WITH ELECTION DATA")
@@ -1020,6 +1100,12 @@ class ProsecutorAnalyzer:
                 'match_method': method,
                 'first_name_compatible': 'Y' if fname_matched else 'N'
             }
+
+            entry_route = self._determine_entry_route(matches)
+            election_stats['entry_route'] = entry_route
+            election_stats['entry_as_challenger'] = entry_route == 'Challenger'
+            election_stats['entry_as_incumbent'] = entry_route == 'Incumbent'
+            election_stats['entry_as_open'] = entry_route in {'Open', 'Appointed/Other'}
 
             if 'candidate_unique_identifier' in matches.columns:
                 valid_ids = matches['candidate_unique_identifier'].dropna()
@@ -1175,32 +1261,48 @@ class ProsecutorAnalyzer:
 
         df = self.df_matched_all[self.df_matched_all['num_elections'] > 0]
 
-        incumbents = df[df['ever_ran_as_incumbent']]
-        challengers = df[df['ever_ran_as_challenger']]
+        challengers = df[df['entry_as_challenger']]
+        incumbents = df[df['entry_as_incumbent']]
+        openers = df[df['entry_as_open']]
 
-        print("INCUMBENCY VS CHALLENGER:")
-        print(f"  Ever ran as incumbent: {len(incumbents)} prosecutors")
-        print(f"    Mean familiarity: {incumbents['familiarity_rate'].mean():.2f}%")
-        print(f"  Ever ran as challenger: {len(challengers)} prosecutors")
-        print(f"    Mean familiarity: {challengers['familiarity_rate'].mean():.2f}%")
+        print("ENTRY ROUTES INTO OFFICE:")
+        for label, subset in (
+            ("Challenger", challengers),
+            ("Incumbent", incumbents),
+            ("Open/Appointed", openers)
+        ):
+            if subset.empty:
+                print(f"  {label:16s}: n=0")
+            else:
+                print(
+                    f"  {label:16s}: n={len(subset):3d} | mean familiarity={subset['familiarity_rate'].mean():.2f}%"
+                )
 
-        inc_mean = incumbents['familiarity_rate'].mean() if len(incumbents) > 0 else np.nan
-        chal_mean = challengers['familiarity_rate'].mean() if len(challengers) > 0 else np.nan
+        inc_mean = incumbents['familiarity_rate'].mean() if len(incumbents) else np.nan
+        chal_mean = challengers['familiarity_rate'].mean() if len(challengers) else np.nan
         diff = inc_mean - chal_mean if pd.notna(inc_mean) and pd.notna(chal_mean) else np.nan
         t_stat = p_val = np.nan
-        if len(incumbents) > 0 and len(challengers) > 0:
-            t_stat, p_val = ttest_ind(incumbents['familiarity_rate'],
-                                     challengers['familiarity_rate'])
-            print(f"  T-test: t={t_stat:.3f}, p={p_val:.4f}")
+        if len(incumbents) > 1 and len(challengers) > 1:
+            t_stat, p_val = ttest_ind(
+                incumbents['familiarity_rate'],
+                challengers['familiarity_rate'],
+                equal_var=False,
+                nan_policy='omit'
+            )
+            print(f"  Welch's t (Incumbent − Challenger): {t_stat:.3f} (p={p_val:.4f})")
             if p_val < 0.05:
                 print("  *** SIGNIFICANT DIFFERENCE ***")
+        else:
+            print("  ⚠️ Not enough challenger/incumbent observations for Welch's t-test")
 
         self.results['incumbency_analysis'] = {
             'incumbent_mean': inc_mean,
             'challenger_mean': chal_mean,
+            'open_mean': openers['familiarity_rate'].mean() if len(openers) else np.nan,
             'difference': diff,
             'incumbent_count': len(incumbents),
             'challenger_count': len(challengers),
+            'open_count': len(openers),
             't_stat': t_stat,
             'p_val': p_val
         }
@@ -1684,137 +1786,183 @@ class ProsecutorAnalyzer:
         return self
     
     def run_multivariate_models(self):
-        """Run TWO multivariate regression models with PROPER sample selection"""
-        print_section("MULTIVARIATE REGRESSION MODELS")
-        
-        # ========================================================================
-        # MODEL 1: Electoral Factors Only - Uses FULL matched sample
-        # ========================================================================
-        
-        print("MODEL 1: FAMILIARITY DRIVERS - Electoral Factors Only")
-        print("Sample: FULL matched sample (all prosecutors with election data)")
-        print("Purpose: Proper state vs notable comparison")
-        print()
-        
+        """Run binomial familiarity models separated by measurement regime."""
+        print_section("BINOMIAL FAMILIARITY MODELS")
+
         if not hasattr(self, 'df_matched_all'):
             print("⚠ Election data not matched yet")
             return self
-        
-        df1 = self.df_matched_all[self.df_matched_all['num_elections'] > 0].copy()
-        
-        print(f"Sample size: {len(df1)} prosecutors")
-        print(f"  Notable: {df1['is_notable'].sum()}")
-        print(f"  State: {(~df1['is_notable']).sum()}")
-        print()
-        
-        # Prepare variables for Model 1 (no ideology - doesn't need ≥10 ratings)
-        X1 = pd.DataFrame({
-            'ever_contested_general': df1['ever_contested_general'].astype(int),
-            'ever_ran_as_challenger': df1['ever_ran_as_challenger'].astype(int),
-            'num_elections': df1['num_elections'],
-            'is_notable': df1['is_notable'].astype(int),
-            'ever_ran_as_incumbent': df1['ever_ran_as_incumbent'].astype(int)
-        })
-        
-        X1 = sm.add_constant(X1)
-        y1 = df1['familiarity_rate']
-        
-        # Run Model 1
-        model1 = sm.OLS(y1, X1).fit()
-        
-        print(model1.summary())
-        print()
-        
-        print("KEY FINDINGS (Model 1):")
-        for var in ['ever_contested_general', 'ever_ran_as_challenger', 
-                   'ever_ran_as_incumbent', 'num_elections', 'is_notable']:
-            coef = model1.params[var]
-            pval = model1.pvalues[var]
-            sig = "***" if pval < 0.001 else "**" if pval < 0.01 else "*" if pval < 0.05 else ""
-            print(f"  {var:30s}: β={coef:7.2f}  p={pval:.4f} {sig}")
-        
-        print(f"\nR²: {model1.rsquared:.3f}")
-        print(f"Adjusted R²: {model1.rsquared_adj:.3f}")
-        
-        self.results['familiarity_model_electoral'] = model1
-        self.results['familiarity_model_electoral_meta'] = {
-            'n': int(model1.nobs),
-            'notable_n': int(df1['is_notable'].sum()),
-            'state_n': int((~df1['is_notable']).sum())
-        }
-        
-        # ========================================================================
-        # MODEL 2: Add Ideology - Uses FILTERED matched sample
-        # ========================================================================
-        
-        print("\n" + "="*80)
-        print("MODEL 2: FAMILIARITY DRIVERS - Electoral Factors + Ideology")
-        print("Sample: FILTERED matched sample (prosecutors with ≥10 ratings)")
-        print("Purpose: Test ideology effects (sample heavily skewed toward notable)")
-        print()
-        
-        df2 = self.df_matched[self.df_matched['num_elections'] > 0].copy()
-        
-        print(f"Sample size: {len(df2)} prosecutors")
-        print(f"  Notable: {df2['is_notable'].sum()} ({100*df2['is_notable'].mean():.1f}%)")
-        print(f"  State: {(~df2['is_notable']).sum()} ({100*(~df2['is_notable']).mean():.1f}%)")
-        print()
-        
-        # Prepare variables for Model 2 (with ideology)
-        X2 = pd.DataFrame({
-            'mean_score': df2['mean_score'],
-            'ever_contested_general': df2['ever_contested_general'].astype(int),
-            'ever_ran_as_challenger': df2['ever_ran_as_challenger'].astype(int),
-            'num_elections': df2['num_elections'],
-            'is_notable': df2['is_notable'].astype(int),
-            'ever_ran_as_incumbent': df2['ever_ran_as_incumbent'].astype(int)
-        })
-        
-        X2 = sm.add_constant(X2)
-        y2 = df2['familiarity_rate']
-        
-        # Run Model 2
-        model2 = sm.OLS(y2, X2).fit()
-        
-        print(model2.summary())
-        print()
-        
-        print("KEY FINDINGS (Model 2):")
-        for var in ['mean_score', 'ever_contested_general', 'ever_ran_as_challenger', 
-                   'ever_ran_as_incumbent', 'num_elections', 'is_notable']:
-            coef = model2.params[var]
-            pval = model2.pvalues[var]
-            sig = "***" if pval < 0.001 else "**" if pval < 0.01 else "*" if pval < 0.05 else ""
-            print(f"  {var:30s}: β={coef:7.2f}  p={pval:.4f} {sig}")
-        
-        print(f"\nR²: {model2.rsquared:.3f}")
-        print(f"Adjusted R²: {model2.rsquared_adj:.3f}")
-        
-        self.results['familiarity_model_with_ideology'] = model2
-        self.results['familiarity_model_with_ideology_meta'] = {
-            'n': int(model2.nobs),
-            'notable_n': int(df2['is_notable'].sum()),
-            'state_n': int((~df2['is_notable']).sum())
-        }
-        
-        # ========================================================================
-        # INTERPRETATION
-        # ========================================================================
-        
-        print("\n" + "="*80)
-        print("INTERPRETATION:")
-        print("="*80)
-        print()
-        print(f"Model 1 provides proper estimate of state vs notable difference (n={len(df1)}):")
-        print(f"  is_notable coefficient: {model1.params['is_notable']:.2f} (p={model1.pvalues['is_notable']:.4f})")
-        if model1.params['is_notable'] < 0:
-            print(f"  → State prosecutors have {abs(model1.params['is_notable']):.1f} percentage points HIGHER familiarity")
-        print()
-        print(f"Model 2 shows ideology effects within mostly notable sample (n={len(df2)}):")
-        print(f"  mean_score coefficient: {model2.params['mean_score']:.2f} (p={model2.pvalues['mean_score']:.4f})")
-        print(f"  is_notable coefficient: {model2.params['is_notable']:.2f} (unreliable - only {(~df2['is_notable']).sum()} state prosecutors)")
-        print()
-        
+
+        df_all = self.df_matched_all[self.df_matched_all['num_elections'] > 0].copy()
+        if df_all.empty:
+            print("⚠ No prosecutors with election histories for GLM models")
+            return self
+
+        print(f"Total prosecutors with election data: {len(df_all)}")
+        print(f"  Notables: {int(df_all['is_notable'].sum())}")
+        print(f"  State-level: {int((~df_all['is_notable']).sum())}")
+
+        # Ensure mutually exclusive entry indicators exist
+        for col in ['entry_as_challenger', 'entry_as_incumbent', 'entry_as_open',
+                    'ever_contested_general', 'ever_contested_primary',
+                    'had_close_general', 'had_close_primary']:
+            if col in df_all.columns:
+                df_all[col] = df_all[col].fillna(False)
+
+        # ------------------------------------------------------------------
+        # Model A: National notables (common denominator = 407)
+        # ------------------------------------------------------------------
+        print("\n" + "=" * 80)
+        print("MODEL A: Notable prosecutors (binomial GLM on familiarity counts)")
+        covars_notable = [
+            'ever_contested_general',
+            'entry_as_challenger',
+            'entry_as_incumbent',
+            'num_elections',
+            'had_close_general'
+        ]
+
+        model_notable, used_notable = self._fit_familiarity_glm(
+            df_all[df_all['is_notable']],
+            covars_notable,
+            'Notable familiarity GLM'
+        )
+
+        if model_notable is not None:
+            print(model_notable.summary())
+            odds = np.exp(model_notable.params)
+            print("\nKey odds ratios (exp(β)):")
+            for var in covars_notable:
+                print(f"  {var:22s}: {odds.get(var, np.nan):.3f}")
+
+            self.results['familiarity_model_notable'] = model_notable
+            self.results['familiarity_model_notable_meta'] = {
+                'n': int(model_notable.nobs),
+                'prosecutors': len(used_notable),
+                'covariates': covars_notable
+            }
+        else:
+            self.results['familiarity_model_notable'] = None
+            self.results['familiarity_model_notable_meta'] = {'n': 0, 'prosecutors': 0, 'covariates': covars_notable}
+
+        # ------------------------------------------------------------------
+        # Model B: State-level prosecutors (state-denominator GLM)
+        # ------------------------------------------------------------------
+        print("\n" + "=" * 80)
+        print("MODEL B: State prosecutors (binomial GLM on state familiarity)")
+        covars_state = [
+            'ever_contested_general',
+            'ever_contested_primary',
+            'entry_as_challenger',
+            'entry_as_incumbent',
+            'num_elections',
+            'had_close_general',
+            'had_close_primary'
+        ]
+
+        model_state, used_state = self._fit_familiarity_glm(
+            df_all[~df_all['is_notable']],
+            covars_state,
+            'State familiarity GLM'
+        )
+
+        if model_state is not None:
+            print(model_state.summary())
+            odds_state = np.exp(model_state.params)
+            print("\nKey odds ratios (exp(β)):")
+            for var in covars_state:
+                if var in odds_state:
+                    print(f"  {var:22s}: {odds_state[var]:.3f}")
+
+            self.results['familiarity_model_state'] = model_state
+            self.results['familiarity_model_state_meta'] = {
+                'n': int(model_state.nobs),
+                'prosecutors': len(used_state),
+                'covariates': covars_state
+            }
+        else:
+            self.results['familiarity_model_state'] = None
+            self.results['familiarity_model_state_meta'] = {'n': 0, 'prosecutors': 0, 'covariates': covars_state}
+
+        # ------------------------------------------------------------------
+        # Ideology-augmented models (filtered sample)
+        # ------------------------------------------------------------------
+        if hasattr(self, 'df_matched') and not self.df_matched.empty:
+            df_filtered = self.df_matched[self.df_matched['num_elections'] > 0].copy()
+            for col in ['entry_as_challenger', 'entry_as_incumbent', 'entry_as_open',
+                        'ever_contested_general', 'ever_contested_primary',
+                        'had_close_general', 'had_close_primary']:
+                if col in df_filtered.columns:
+                    df_filtered[col] = df_filtered[col].fillna(False)
+
+            print("\n" + "=" * 80)
+            print("MODEL C: Notable prosecutors with ideology (filtered sample)")
+            covars_notable_ideol = covars_notable + ['mean_score']
+            model_notable_ideol, used_notable_ideol = self._fit_familiarity_glm(
+                df_filtered[df_filtered['is_notable']],
+                covars_notable_ideol,
+                'Notable familiarity + ideology GLM'
+            )
+
+            if model_notable_ideol is not None:
+                print(model_notable_ideol.summary())
+                odds_notable_ideol = np.exp(model_notable_ideol.params)
+                print("\nKey odds ratios (exp(β)):")
+                for var in covars_notable_ideol:
+                    if var in odds_notable_ideol:
+                        print(f"  {var:22s}: {odds_notable_ideol[var]:.3f}")
+
+                self.results['familiarity_model_notable_ideology'] = model_notable_ideol
+                self.results['familiarity_model_notable_ideology_meta'] = {
+                    'n': int(model_notable_ideol.nobs),
+                    'prosecutors': len(used_notable_ideol),
+                    'covariates': covars_notable_ideol
+                }
+            else:
+                self.results['familiarity_model_notable_ideology'] = None
+                self.results['familiarity_model_notable_ideology_meta'] = {
+                    'n': 0,
+                    'prosecutors': 0,
+                    'covariates': covars_notable_ideol
+                }
+
+            print("\n" + "=" * 80)
+            print("MODEL D: State prosecutors with ideology (filtered sample)")
+            covars_state_ideol = covars_state + ['mean_score']
+            model_state_ideol, used_state_ideol = self._fit_familiarity_glm(
+                df_filtered[~df_filtered['is_notable']],
+                covars_state_ideol,
+                'State familiarity + ideology GLM'
+            )
+
+            if model_state_ideol is not None:
+                print(model_state_ideol.summary())
+                odds_state_ideol = np.exp(model_state_ideol.params)
+                print("\nKey odds ratios (exp(β)):")
+                for var in covars_state_ideol:
+                    if var in odds_state_ideol:
+                        print(f"  {var:22s}: {odds_state_ideol[var]:.3f}")
+
+                self.results['familiarity_model_state_ideology'] = model_state_ideol
+                self.results['familiarity_model_state_ideology_meta'] = {
+                    'n': int(model_state_ideol.nobs),
+                    'prosecutors': len(used_state_ideol),
+                    'covariates': covars_state_ideol
+                }
+            else:
+                self.results['familiarity_model_state_ideology'] = None
+                self.results['familiarity_model_state_ideology_meta'] = {
+                    'n': 0,
+                    'prosecutors': 0,
+                    'covariates': covars_state_ideol
+                }
+        else:
+            print("\n⚠ Filtered (≥10 ratings) sample unavailable for ideology models")
+            self.results['familiarity_model_notable_ideology'] = None
+            self.results['familiarity_model_notable_ideology_meta'] = {'n': 0, 'prosecutors': 0, 'covariates': []}
+            self.results['familiarity_model_state_ideology'] = None
+            self.results['familiarity_model_state_ideology_meta'] = {'n': 0, 'prosecutors': 0, 'covariates': []}
+
         return self
     
     def export_results(self, output_dir):
@@ -1863,23 +2011,17 @@ class ProsecutorAnalyzer:
             f.write("1. Notable prosecutor familiarity = substantive_ratings / 407 (completed national section)\n")
             f.write("2. State prosecutor familiarity = substantive_ratings / state_respondents_who_engaged\n")
             f.write("3. Scale corrected to 1-4 (Very Traditional to Very Progressive)\n")
-            model1_meta = self.results.get('familiarity_model_electoral_meta')
-            model2_meta = self.results.get('familiarity_model_with_ideology_meta')
-            if model1_meta and model2_meta:
-                share_notable = (model2_meta['notable_n'] / model2_meta['n'] * 100) if model2_meta['n'] else 0
+            notable_meta = self.results.get('familiarity_model_notable_meta')
+            state_meta = self.results.get('familiarity_model_state_meta')
+            if notable_meta or state_meta:
+                n_notable = notable_meta.get('prosecutors', 0) if notable_meta else 0
+                n_state = state_meta.get('prosecutors', 0) if state_meta else 0
                 f.write(
-                    "4. Regression models recalculated on matched datasets: "
-                    f"Model 1 (electoral factors) uses n={model1_meta['n']} "
-                    f"(notable={model1_meta['notable_n']}, state={model1_meta['state_n']}); "
-                    f"Model 2 (adds ideology) uses n={model2_meta['n']} "
-                    f"({share_notable:.1f}% notable).\n\n"
-                )
-            elif model1_meta:
-                f.write(
-                    f"4. Regression model (electoral factors) uses the full matched sample (n={model1_meta['n']}).\n\n"
+                    "4. Familiarity modeled with binomial GLMs (counts + denominators) "
+                    f"— Notables used={n_notable}, State-level used={n_state}.\n\n"
                 )
             else:
-                f.write("4. Regression models run only when matched election data are available.\n\n")
+                f.write("4. Familiarity GLMs run only when matched election data are available.\n\n")
             f.write("METHODOLOGY:\n")
             f.write("-" * 80 + "\n")
             f.write(f"Total initiated: 496\n")
@@ -1896,40 +2038,69 @@ class ProsecutorAnalyzer:
                 f.write(f"Difference: {fam['difference']:+.2f} percentage points\n")
                 f.write(f"T-test: t={fam['t_stat']:.3f}, p={fam['p_val']:.4f}\n\n")
             
-            if 'familiarity_model_electoral' in self.results:
-                model1 = self.results['familiarity_model_electoral']
-                meta1 = self.results.get('familiarity_model_electoral_meta', {})
-                n1 = meta1.get('n', int(model1.nobs))
-                f.write(f"MODEL 1: FAMILIARITY DRIVERS (Electoral Factors, n={n1}):\n")
+            if self.results.get('familiarity_model_notable') is not None:
+                model = self.results['familiarity_model_notable']
+                meta = self.results.get('familiarity_model_notable_meta', {})
+                f.write("MODEL A: Notable Familiarity (Binomial GLM)\n")
                 f.write("-" * 80 + "\n")
-                f.write(f"R² = {model1.rsquared:.3f}\n")
-                f.write(f"State vs Notable: β={model1.params['is_notable']:.2f}, p={model1.pvalues['is_notable']:.4f}\n")
-                f.write(f"Ran as Challenger: β={model1.params['ever_ran_as_challenger']:.2f}, p={model1.pvalues['ever_ran_as_challenger']:.4f}\n")
-                f.write(f"Contested General: β={model1.params['ever_contested_general']:.2f}, p={model1.pvalues['ever_contested_general']:.4f}\n")
-                f.write(f"Number of Elections: β={model1.params['num_elections']:.2f}, p={model1.pvalues['num_elections']:.4f}\n\n")
-            
-            if 'familiarity_model_with_ideology' in self.results:
-                model2 = self.results['familiarity_model_with_ideology']
-                meta2 = self.results.get('familiarity_model_with_ideology_meta', {})
-                n2 = meta2.get('n', int(model2.nobs))
-                notable_n = meta2.get('notable_n')
-                share_notable = (notable_n / n2 * 100) if (notable_n is not None and n2) else None
-                state_n = meta2.get('state_n')
-                f.write(f"MODEL 2: FAMILIARITY + IDEOLOGY (n={n2}")
-                if share_notable is not None:
-                    f.write(f", {share_notable:.1f}% notable")
-                f.write("):\n")
+                f.write(
+                    f"Prosecutors used: {meta.get('prosecutors', 0)} | Weighted observations (ratings opportunities): {meta.get('n', model.nobs)}\n"
+                )
+                for var in meta.get('covariates', []):
+                    if var in model.params:
+                        beta = model.params[var]
+                        pval = model.pvalues[var]
+                        odds = np.exp(beta)
+                        f.write(f"{var:24s}: β={beta:6.3f}, OR={odds:6.3f}, p={pval:.4f}\n")
+                f.write("\n")
+
+            if self.results.get('familiarity_model_state') is not None:
+                model = self.results['familiarity_model_state']
+                meta = self.results.get('familiarity_model_state_meta', {})
+                f.write("MODEL B: State Familiarity (Binomial GLM)\n")
                 f.write("-" * 80 + "\n")
-                f.write(f"R² = {model2.rsquared:.3f}\n")
-                f.write(f"Progressiveness: β={model2.params['mean_score']:.2f}, p={model2.pvalues['mean_score']:.4f}\n")
-                f.write(f"Contested General: β={model2.params['ever_contested_general']:.2f}, p={model2.pvalues['ever_contested_general']:.4f}\n")
-                if state_n is not None:
-                    f.write(
-                        f"Note: is_notable coefficient unstable due to only {state_n} state prosecutor"
-                        f"{'s' if state_n != 1 else ''} in this filtered sample\n\n"
-                    )
-                else:
-                    f.write("Note: is_notable coefficient unstable because the filtered sample is overwhelmingly notable prosecutors.\n\n")
+                f.write(
+                    f"Prosecutors used: {meta.get('prosecutors', 0)} | Weighted observations: {meta.get('n', model.nobs)}\n"
+                )
+                for var in meta.get('covariates', []):
+                    if var in model.params:
+                        beta = model.params[var]
+                        pval = model.pvalues[var]
+                        odds = np.exp(beta)
+                        f.write(f"{var:24s}: β={beta:6.3f}, OR={odds:6.3f}, p={pval:.4f}\n")
+                f.write("\n")
+
+            if self.results.get('familiarity_model_notable_ideology') is not None:
+                model = self.results['familiarity_model_notable_ideology']
+                meta = self.results.get('familiarity_model_notable_ideology_meta', {})
+                f.write("MODEL C: Notable Familiarity + Ideology (Binomial GLM)\n")
+                f.write("-" * 80 + "\n")
+                f.write(
+                    f"Prosecutors used: {meta.get('prosecutors', 0)} | Weighted observations: {meta.get('n', model.nobs)}\n"
+                )
+                for var in meta.get('covariates', []):
+                    if var in model.params:
+                        beta = model.params[var]
+                        pval = model.pvalues[var]
+                        odds = np.exp(beta)
+                        f.write(f"{var:24s}: β={beta:6.3f}, OR={odds:6.3f}, p={pval:.4f}\n")
+                f.write("\n")
+
+            if self.results.get('familiarity_model_state_ideology') is not None:
+                model = self.results['familiarity_model_state_ideology']
+                meta = self.results.get('familiarity_model_state_ideology_meta', {})
+                f.write("MODEL D: State Familiarity + Ideology (Binomial GLM)\n")
+                f.write("-" * 80 + "\n")
+                f.write(
+                    f"Prosecutors used: {meta.get('prosecutors', 0)} | Weighted observations: {meta.get('n', model.nobs)}\n"
+                )
+                for var in meta.get('covariates', []):
+                    if var in model.params:
+                        beta = model.params[var]
+                        pval = model.pvalues[var]
+                        odds = np.exp(beta)
+                        f.write(f"{var:24s}: β={beta:6.3f}, OR={odds:6.3f}, p={pval:.4f}\n")
+                f.write("\n")
             
             if 'top_10' in self.results.get('familiarity_comparison', {}):
                 f.write("TOP 10 PROSECUTORS BY FAMILIARITY:\n")
@@ -2328,10 +2499,12 @@ class IntegratedReporter:
             notable = df[df['is_notable']]
             state = df[~df['is_notable']]
 
-            challengers = notable[notable['ever_ran_as_challenger']]
-            incumbents = notable[notable['ever_ran_as_incumbent']]
-            state_challengers = state[state['ever_ran_as_challenger']]
-            state_incumbents = state[state['ever_ran_as_incumbent']]
+            challengers = notable[notable['entry_as_challenger']]
+            incumbents = notable[notable['entry_as_incumbent']]
+            openers = notable[notable['entry_as_open']]
+            state_challengers = state[state['entry_as_challenger']]
+            state_incumbents = state[state['entry_as_incumbent']]
+            state_openers = state[state['entry_as_open']]
 
             notable_with_elections = notable[notable['num_elections'] > 0]
             state_with_elections = state[state['num_elections'] > 0]
@@ -2341,14 +2514,22 @@ class IntegratedReporter:
 
             fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 
-            axes[0, 0].boxplot([challengers['familiarity_rate'], incumbents['familiarity_rate']],
-                               labels=['Challenger', 'Incumbent'])
+            box_data_notable = [
+                challengers['familiarity_rate'] if not challengers.empty else [np.nan],
+                incumbents['familiarity_rate'] if not incumbents.empty else [np.nan],
+                openers['familiarity_rate'] if not openers.empty else [np.nan]
+            ]
+            axes[0, 0].boxplot(box_data_notable, labels=['Challenger', 'Incumbent', 'Open/Appointed'])
             axes[0, 0].set_ylabel('Familiarity Rate (%)')
             axes[0, 0].set_title('RQ3: Notable Prosecutors\nChallenger vs. Incumbent', fontweight='bold')
             axes[0, 0].grid(axis='y', alpha=0.3)
 
-            axes[0, 1].boxplot([state_challengers['familiarity_rate'], state_incumbents['familiarity_rate']],
-                               labels=['Challenger', 'Incumbent'])
+            box_data_state = [
+                state_challengers['familiarity_rate'] if not state_challengers.empty else [np.nan],
+                state_incumbents['familiarity_rate'] if not state_incumbents.empty else [np.nan],
+                state_openers['familiarity_rate'] if not state_openers.empty else [np.nan]
+            ]
+            axes[0, 1].boxplot(box_data_state, labels=['Challenger', 'Incumbent', 'Open/Appointed'])
             axes[0, 1].set_ylabel('Familiarity Rate (%)')
             axes[0, 1].set_title('RQ3: State Prosecutors\nChallenger vs. Incumbent', fontweight='bold')
             axes[0, 1].grid(axis='y', alpha=0.3)
@@ -2851,6 +3032,41 @@ class IntegratedReporter:
                 lines.append(f"  {row['name']:<35s}  Mean={row['mean_score']:.2f}  Familiarity={row['familiarity_rate']:.1f}%")
             lines.append("")
 
+        model_pairs = [
+            ("MODEL A: Notable Familiarity (Binomial GLM)", 'familiarity_model_notable', 'familiarity_model_notable_meta'),
+            ("MODEL B: State Familiarity (Binomial GLM)", 'familiarity_model_state', 'familiarity_model_state_meta'),
+            (
+                "MODEL C: Notable Familiarity + Ideology (Binomial GLM)",
+                'familiarity_model_notable_ideology',
+                'familiarity_model_notable_ideology_meta'
+            ),
+            (
+                "MODEL D: State Familiarity + Ideology (Binomial GLM)",
+                'familiarity_model_state_ideology',
+                'familiarity_model_state_ideology_meta'
+            )
+        ]
+
+        for title, model_key, meta_key in model_pairs:
+            model = self.analyzer.results.get(model_key)
+            meta = self.analyzer.results.get(meta_key, {})
+            if model is None:
+                continue
+            lines.append(title)
+            lines.append("  " + "-" * (len(title) - 2))
+            lines.append(
+                f"  Prosecutors used: {meta.get('prosecutors', 0)} | Weighted obs: {meta.get('n', model.nobs)}"
+            )
+            for var in meta.get('covariates', []):
+                if var in model.params:
+                    beta = model.params[var]
+                    odds = np.exp(beta)
+                    pval = model.pvalues[var]
+                    lines.append(
+                        f"  {var.replace('_', ' ').title()}: β={beta:.3f} | OR={odds:.3f} | p={pval:.4f}"
+                    )
+            lines.append("")
+
         if len(dfm):
             lines.append("Election & recall context (matched sample):")
             lines.append(f"  Prosecutors matched with elections: {len(dfm)}")
@@ -3224,6 +3440,30 @@ class IntegratedReporter:
             lines.append(f"Ever contested any election: familiarity {fmt_num(overall_contestation.get('contested_mean'))}% (n={overall_contestation.get('contested_count', 0)})")
             lines.append(f"Never contested: familiarity {fmt_num(overall_contestation.get('uncontested_mean'))}% (n={overall_contestation.get('uncontested_count', 0)})")
             lines.append(f"Difference: {fmt_num(overall_contestation.get('difference'))} pp (t = {fmt_num(overall_contestation.get('t_stat'))}, p = {fmt_num(overall_contestation.get('p_val'))})")
+
+        model_specs = [
+            ("MODEL A: Notable Familiarity (Binomial GLM)", 'familiarity_model_notable', 'familiarity_model_notable_meta'),
+            ("MODEL B: State Familiarity (Binomial GLM)", 'familiarity_model_state', 'familiarity_model_state_meta'),
+            ("MODEL C: Notable Familiarity + Ideology (Binomial GLM)", 'familiarity_model_notable_ideology', 'familiarity_model_notable_ideology_meta'),
+            ("MODEL D: State Familiarity + Ideology (Binomial GLM)", 'familiarity_model_state_ideology', 'familiarity_model_state_ideology_meta')
+        ]
+        for title, model_key, meta_key in model_specs:
+            model = results.get(model_key)
+            meta = results.get(meta_key, {})
+            if model is None:
+                continue
+            lines.append(title)
+            lines.append(
+                f"  Prosecutors used: {meta.get('prosecutors', 0)} | Weighted obs: {meta.get('n', model.nobs)}"
+            )
+            for var in meta.get('covariates', []):
+                if var in model.params:
+                    beta = model.params[var]
+                    odds = np.exp(beta)
+                    pval = model.pvalues[var]
+                    lines.append(
+                        f"  {var.replace('_', ' ').title()}: β={beta:.3f} | OR={odds:.3f} | p={pval:.4f}"
+                    )
         lines.append("")
 
         add_section("Incumbency and Challenger Pathways")
@@ -3231,6 +3471,7 @@ class IntegratedReporter:
         if incumbency:
             lines.append(f"Incumbents (n={incumbency.get('incumbent_count', 0)}): familiarity {fmt_num(incumbency.get('incumbent_mean'))}%")
             lines.append(f"Challengers (n={incumbency.get('challenger_count', 0)}): familiarity {fmt_num(incumbency.get('challenger_mean'))}%")
+            lines.append(f"Open/Appointed entry (n={incumbency.get('open_count', 0)}): familiarity {fmt_num(incumbency.get('open_mean'))}%")
             lines.append(f"Difference: {fmt_num(incumbency.get('difference'))} pp (t = {fmt_num(incumbency.get('t_stat'))}, p = {fmt_num(incumbency.get('p_val'))})")
         logistic = vis_results.get('logistic_close_victory') or {}
         if logistic:
